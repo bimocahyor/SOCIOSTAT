@@ -478,10 +478,27 @@ const Stats = (() => {
       rawCols[vn] = cases.map(row => {
         let v = row[vn];  // cases are objects keyed by variable name
         if (v === null || v === undefined || v === '') return null;
-        // Type coercion for numeric variables
-        if (meta.type === 'numeric' || meta.measurementLevel === 'scale') {
-          const num = Number(v);
-          v = isNaN(num) ? null : num;
+        // Type coercion: ONLY when variable metadata says numeric.
+        // Do NOT coerce based solely on measurementLevel — a string variable with
+        // measurementLevel='scale' would silently convert all values to NaN → null.
+        if (meta.type === 'numeric') {
+          if (typeof v === 'number') {
+            v = isFinite(v) ? v : null;
+          } else if (typeof v === 'string' && v.trim() !== '') {
+            // Use full semantic parser (handles currency, locale, percentage).
+            // DataTypeConverter may not be defined in isolated test contexts —
+            // fall back to normalized Number() coercion.
+            if (typeof DataTypeConverter !== 'undefined') {
+              const parsed = DataTypeConverter.parseSemanticNumber(v);
+              v = parsed !== null ? parsed.value : null;
+            } else {
+              const raw = v.trim().replace(/\u00a0/g, '').replace(/,(?=\d{3}(\D|$))/g, '');
+              const num = Number(raw);
+              v = isNaN(num) ? null : num;
+            }
+          } else {
+            v = null;
+          }
         }
         // User-defined missing values check
         if (v !== null && userMissing.length > 0) {
@@ -1854,6 +1871,2888 @@ const StatProcs = (() => {
 const ProcedureRegistry = StatProcs;
 
 /* ══════════════════════════════════════════════════════════════════
+   SECTION 4B-DIAG: DATA INTEGRITY CHECK
+   Provides DataIntegrity.check(dataset) for diagnostic use.
+   Also exposed as DataIntegrity.report(dataset) → HTML string.
+   ══════════════════════════════════════════════════════════════════ */
+
+const DataIntegrity = (() => {
+
+  /**
+   * Checks that every variable in dataset.variables has a corresponding key
+   * in dataset.cases rows, and reports numeric coercion success rates.
+   *
+   * Returns a structured report object — never throws.
+   */
+  function check(dataset) {
+    if (!dataset) return { ok: false, fatal: 'No dataset provided.' };
+
+    const variables  = dataset.variables  || [];
+    const cases      = dataset.cases      || [];
+    const nCases     = cases.length;
+    const nVariables = variables.length;
+
+    const variableReports = variables.map(meta => {
+      const vn = meta.name;
+      // Count how many case rows actually have this key (even if null)
+      let caseKeyCount  = 0;
+      let numericCount  = 0;
+      let missingCount  = 0;
+      let invalidCount  = 0;
+      const sampleValues = [];
+
+      for (let i = 0; i < nCases; i++) {
+        const row = cases[i];
+        if (Object.prototype.hasOwnProperty.call(row, vn)) {
+          caseKeyCount++;
+          const raw = row[vn];
+          if (raw === null || raw === undefined || raw === '') {
+            missingCount++;
+          } else if (meta.type === 'numeric') {
+            const cleaned = typeof raw === 'string'
+              ? raw.trim().replace(/\u00a0/g,'').replace(/,(?=\d{3}(\D|$))/g,'')
+              : raw;
+            const num = Number(cleaned);
+            if (isNaN(num)) { invalidCount++; missingCount++; }
+            else { numericCount++; }
+          } else {
+            // string / date / other — always valid unless empty
+            numericCount++;
+          }
+          if (sampleValues.length < 5 && raw !== null && raw !== undefined && raw !== '') {
+            sampleValues.push(raw);
+          }
+        } else {
+          missingCount++;  // key entirely absent from row
+        }
+      }
+
+      const keyMissing = nCases - caseKeyCount;
+      return {
+        variable: vn,
+        metadataType: meta.type,
+        measurementLevel: meta.measurementLevel,
+        caseKeyCount,
+        keyMissingCount: keyMissing,
+        numericCount,
+        missingCount,
+        invalidCount,
+        sampleValues,
+        // Diagnostic flags
+        noKeysInCases:   caseKeyCount === 0 && nCases > 0,
+        allValuesMissing: missingCount === nCases && nCases > 0,
+        allNumericInvalid: meta.type === 'numeric' && nCases > 0 && numericCount === 0 && (nCases - missingCount) > 0,
+      };
+    });
+
+    // Summary
+    const matchingVars  = variableReports.filter(r => !r.noKeysInCases);
+    const mismatchedVars = variableReports.filter(r => r.noKeysInCases);
+    const problemVars   = variableReports.filter(r => r.allValuesMissing || r.allNumericInvalid);
+
+    // Check for orphan case keys (keys in cases that have no variable metadata)
+    const varNameSet = new Set(variables.map(v => v.name));
+    const orphanKeys = new Set();
+    cases.slice(0, Math.min(20, nCases)).forEach(row => {
+      Object.keys(row).forEach(k => { if (!varNameSet.has(k)) orphanKeys.add(k); });
+    });
+
+    // Active filter
+    const activeFilter   = dataset.activeFilter   || null;
+    const weightVariable = dataset.weightVariable || null;
+    const splitVariables = dataset.splitVariables || [];
+
+    let filterMatchedCases = null;
+    let filterWarning = null;
+    if (activeFilter) {
+      try {
+        const allVarNames = variables.map(v => v.name);
+        const expr = activeFilter.replace(/\bAND\b/gi,'&&').replace(/\bOR\b/gi,'||').replace(/\bNOT\b/gi,'!');
+        // eslint-disable-next-line no-new-func
+        const fn = new Function(...allVarNames, `"use strict"; return !!(${expr});`);
+        filterMatchedCases = cases.filter(row => {
+          try { return fn(...allVarNames.map(vn => row[vn] ?? null)); } catch { return true; }
+        }).length;
+        if (filterMatchedCases === 0) filterWarning = 'CRITICAL: Active filter removes all cases.';
+      } catch(e) {
+        filterWarning = 'Filter expression error: ' + e.message;
+      }
+    }
+
+    const ok = mismatchedVars.length === 0 && problemVars.length === 0 && orphanKeys.size === 0;
+
+    return {
+      ok,
+      cases: nCases,
+      variables: nVariables,
+      variablesWithMatchingKeys: matchingVars.length,
+      variablesWithMissingKeys:  mismatchedVars.length,
+      numericVariables: variableReports.filter(r => r.metadataType === 'numeric').length,
+      orphanCaseKeys: [...orphanKeys],
+      activeFilter,
+      activeWeight: weightVariable,
+      activeSplit: splitVariables,
+      filterMatchedCases,
+      filterWarning,
+      variableReports,
+      mismatchedVars,
+      problemVars,
+    };
+  }
+
+  /** Render the check() result into an HTML string for the Data View panel. */
+  function report(dataset) {
+    const r = check(dataset);
+    const lines = [];
+
+    const statusColor = r.ok ? '#15803d' : '#b91c1c';
+    const statusIcon  = r.ok ? '✓' : '✗';
+    lines.push(`<div style="font-family:monospace;font-size:12px;padding:16px;overflow:auto;background:#1e1e2e;color:#cdd6f4;border-radius:8px;max-height:520px;">`);
+    lines.push(`<div style="color:${statusColor};font-weight:700;font-size:14px;margin-bottom:12px;">${statusIcon} DATA INTEGRITY CHECK — ${r.ok ? 'PASS' : 'ISSUES FOUND'}</div>`);
+
+    lines.push(`<div style="color:#89b4fa;margin-bottom:6px;">DATASET SUMMARY</div>`);
+    lines.push(`<div>Cases: <b style="color:#a6e3a1">${r.cases}</b></div>`);
+    lines.push(`<div>Variables: <b style="color:#a6e3a1">${r.variables}</b></div>`);
+    lines.push(`<div>Variables with matching case keys: <b style="color:#a6e3a1">${r.variablesWithMatchingKeys}</b></div>`);
+    if (r.variablesWithMissingKeys > 0) {
+      lines.push(`<div style="color:#f38ba8;">⚠ Variables with NO case keys: <b>${r.variablesWithMissingKeys}</b></div>`);
+    }
+    if (r.orphanCaseKeys.length > 0) {
+      lines.push(`<div style="color:#fab387;">⚠ Orphan case keys (no metadata): <b>${r.orphanCaseKeys.join(', ')}</b></div>`);
+    }
+    if (r.activeFilter) {
+      lines.push(`<div style="margin-top:6px;color:#cba6f7;">Active filter: <code>${r.activeFilter}</code></div>`);
+      lines.push(`<div>Filter matched: <b>${r.filterMatchedCases ?? '?'}</b> / ${r.cases} cases</div>`);
+      if (r.filterWarning) lines.push(`<div style="color:#f38ba8;font-weight:700;">${r.filterWarning}</div>`);
+    }
+    if (r.activeWeight) lines.push(`<div>Weight variable: <b>${r.activeWeight}</b></div>`);
+
+    lines.push(`<div style="color:#89b4fa;margin:12px 0 6px;">VARIABLE DETAILS</div>`);
+    r.variableReports.forEach(v => {
+      const prob = v.noKeysInCases || v.allValuesMissing || v.allNumericInvalid;
+      const col  = prob ? '#f38ba8' : '#a6e3a1';
+      lines.push(`<div style="margin-bottom:4px;border-bottom:1px solid #313244;padding-bottom:4px;">`);
+      lines.push(`<span style="color:${col};font-weight:700;">${v.variable}</span> `);
+      lines.push(`<span style="color:#9399b2;">[${v.metadataType}, ${v.measurementLevel}]</span> `);
+      lines.push(`keys:${v.caseKeyCount} numeric:${v.numericCount} missing:${v.missingCount}`);
+      if (v.invalidCount > 0)   lines.push(` <span style="color:#f38ba8;">invalid:${v.invalidCount}</span>`);
+      if (v.noKeysInCases)      lines.push(` <span style="color:#f38ba8;font-weight:700;">⚠ NO CASE KEYS — SCHEMA MISMATCH</span>`);
+      if (v.allValuesMissing)   lines.push(` <span style="color:#f38ba8;font-weight:700;">⚠ ALL VALUES MISSING</span>`);
+      if (v.allNumericInvalid)  lines.push(` <span style="color:#f38ba8;font-weight:700;">⚠ ALL NUMERIC VALUES INVALID (failed Number())</span>`);
+      if (v.sampleValues.length > 0) {
+        lines.push(`<br><span style="color:#6c7086;">sample: ${v.sampleValues.map(x=>JSON.stringify(x)).join(', ')}</span>`);
+      }
+      lines.push(`</div>`);
+    });
+
+    lines.push(`</div>`);
+    return lines.join('');
+  }
+
+  /**
+   * Migrate a dataset loaded from an older version where case keys may not
+   * match variable names. Strategy: for each variable, if no case has the
+   * variable name as a key but every case has an orphan key at the same
+   * positional index, remap atomically.
+   *
+   * This is safe — it only renames keys in cases[], never changes values.
+   * Returns { migrated: true/false, changes: [...] }.
+   */
+  function migrateSchema(dataset) {
+    if (!dataset) return { migrated: false, changes: [] };
+    const variables = dataset.variables || [];
+    const cases     = dataset.cases     || [];
+    if (!cases.length || !variables.length) return { migrated: false, changes: [] };
+
+    const changes = [];
+
+    // Build set of all keys present in first case row
+    const firstRow   = cases[0];
+    const caseKeys   = Object.keys(firstRow);
+    const varNames   = variables.map(v => v.name);
+    const varNameSet = new Set(varNames);
+
+    // Find orphan keys — present in cases but absent from variable metadata
+    const orphans = caseKeys.filter(k => !varNameSet.has(k));
+
+    // Find variables that have NO matching case key
+    const homeless = varNames.filter(vn => !Object.prototype.hasOwnProperty.call(firstRow, vn));
+
+    if (homeless.length === 0) return { migrated: false, changes: [] };  // nothing to fix
+
+    // Positional recovery: if there are exactly as many orphans as homeless vars,
+    // attempt positional remapping (old schema stored var001, var002, var003…)
+    if (orphans.length === homeless.length && orphans.length > 0) {
+      // Sort both lists by their index position
+      const orphansSorted  = caseKeys.filter(k => orphans.includes(k));
+      const homelessSorted = variables
+        .filter(v => homeless.includes(v.name))
+        .map(v => v.name);
+
+      const oldToNew = {};
+      homelessSorted.forEach((vn, i) => { oldToNew[orphansSorted[i]] = vn; });
+
+      // Apply the remapping to every case
+      cases.forEach(row => {
+        for (const [oldKey, newKey] of Object.entries(oldToNew)) {
+          if (Object.prototype.hasOwnProperty.call(row, oldKey)) {
+            row[newKey] = row[oldKey];
+            delete row[oldKey];
+          }
+        }
+      });
+
+      for (const [old, nw] of Object.entries(oldToNew)) {
+        changes.push({ from: old, to: nw });
+      }
+
+      dataset.metadata = dataset.metadata || {};
+      dataset.metadata.schemaMigrated = true;
+      dataset.metadata.schemaMigratedAt = new Date().toISOString();
+      dataset.updatedAt = new Date().toISOString();
+
+      return { migrated: true, changes };
+    }
+
+    return { migrated: false, changes: [], note: 'Orphan/homeless count mismatch — manual inspection needed.' };
+  }
+
+  /**
+   * inspect(dataset) — console-friendly text output for developer diagnostics.
+   * Mirrors the spec's required DataIntegrity.inspect() output format.
+   */
+  function inspect(dataset) {
+    const r = check(dataset);
+    const lines = [];
+
+    lines.push('═══ DATA INTEGRITY REPORT ═══');
+    lines.push(`Dataset: ${dataset?.name || '(unnamed)'}`);
+    lines.push(`Cases: ${r.cases}`);
+    lines.push(`Variables: ${r.variables}`);
+    lines.push(`Status: ${r.ok ? 'PASS ✓' : 'ISSUES FOUND ✗'}`);
+    lines.push('');
+
+    if (r.activeFilter)  lines.push(`Active Filter: ${r.activeFilter}  (matched: ${r.filterMatchedCases ?? '?'})`);
+    else                  lines.push('Active Filter: None');
+    lines.push(`Weight: ${r.activeWeight || 'None'}`);
+    lines.push(`Split: ${r.activeSplit?.length ? r.activeSplit.join(', ') : 'None'}`);
+
+    if (r.filterWarning) lines.push(`⚠ FILTER WARNING: ${r.filterWarning}`);
+    if (r.orphanCaseKeys.length) lines.push(`⚠ Orphan case keys (no metadata): ${r.orphanCaseKeys.join(', ')}`);
+    lines.push('');
+
+    lines.push('─── Variable Details ───');
+    r.variableReports.forEach(v => {
+      const flag = v.noKeysInCases ? ' ⚠ NO CASE KEYS' :
+                   v.allValuesMissing ? ' ⚠ ALL MISSING' :
+                   v.allNumericInvalid ? ' ⚠ ALL NUMERIC INVALID' : '';
+      lines.push(`${v.variable}${flag}`);
+      lines.push(`  type: ${v.metadataType}  level: ${v.measurementLevel}`);
+      lines.push(`  caseKeyExists: ${v.caseKeyCount} / ${r.cases}`);
+      lines.push(`  validNumeric: ${v.numericCount}`);
+      lines.push(`  missing: ${v.missingCount}`);
+      if (v.invalidCount > 0) lines.push(`  invalid: ${v.invalidCount}`);
+      if (v.sampleValues.length > 0) lines.push(`  sampleValues: ${v.sampleValues.join(', ')}`);
+      lines.push('');
+    });
+
+    const text = lines.join('\n');
+    console.log(text);
+    return text;
+  }
+
+  return { check, report, inspect, migrateSchema };
+})();
+
+/* ══════════════════════════════════════════════════════════════════
+   SECTION 4B-PIPE: DATA PIPELINE INSPECTOR
+   Instruments every stage: import schema → resolve → coercion → filter
+   Exposes DataPipelineInspector.inspect(dataset) and .selfTest()
+   ══════════════════════════════════════════════════════════════════ */
+
+const DataPipelineInspector = (() => {
+
+  /* ── Stage 1: inspect a live dataset object ─────────────────── */
+  function inspect(dataset) {
+    if (!dataset) return { ok: false, stages: [], fatal: 'No dataset' };
+
+    const stages = [];
+    let ok = true;
+
+    // ── S1: basic shape ──────────────────────────────────────────
+    const nCases = (dataset.cases || []).length;
+    const nVars  = (dataset.variables || []).length;
+    const s1 = {
+      stage: 'S1_SHAPE',
+      cases: nCases,
+      variables: nVars,
+      ok: nCases > 0 && nVars > 0,
+      detail: nCases === 0 ? 'dataset.cases is empty' : nVars === 0 ? 'dataset.variables is empty' : 'OK',
+    };
+    stages.push(s1);
+    if (!s1.ok) { ok = false; return { ok, stages, firstFailure: s1 }; }
+
+    // ── S2: first 3 raw case objects ─────────────────────────────
+    const sampleCases = dataset.cases.slice(0, 3).map((row, i) => ({
+      index: i,
+      keys: Object.keys(row),
+      values: Object.fromEntries(Object.entries(row).slice(0, 15)) // cap at 15 cols
+    }));
+    stages.push({ stage: 'S2_RAW_CASES', sampleCases });
+
+    // ── S3: variable-level key + coercion check ───────────────────
+    const varReports = dataset.variables.map(meta => {
+      const vn = meta.name;
+      let keyMatches = 0, nullCount = 0, numericOk = 0, numericFail = 0;
+      const sampleValues = [], coerceFails = [];
+
+      for (let i = 0; i < nCases; i++) {
+        const row = dataset.cases[i];
+        if (!Object.prototype.hasOwnProperty.call(row, vn)) { nullCount++; continue; }
+        keyMatches++;
+        const raw = row[vn];
+        if (raw === null || raw === undefined || raw === '') { nullCount++; continue; }
+        if (sampleValues.length < 5) sampleValues.push({ raw, type: typeof raw });
+        if (meta.type === 'numeric') {
+          const cleaned = typeof raw === 'string'
+            ? raw.trim().replace(/\u00a0/g, '').replace(/,(?=\d{3}(\D|$))/g, '')
+            : raw;
+          const num = Number(cleaned);
+          if (isNaN(num)) {
+            numericFail++;
+            if (coerceFails.length < 3) coerceFails.push({ raw, reason: 'Number(' + JSON.stringify(cleaned) + ') = NaN' });
+          } else {
+            numericOk++;
+          }
+        } else {
+          numericOk++;  // non-numeric vars count as valid
+        }
+      }
+
+      const schemaOk   = keyMatches === nCases;
+      const coercionOk = meta.type !== 'numeric' || numericFail === 0;
+
+      return {
+        name: vn,
+        type: meta.type,
+        measurementLevel: meta.measurementLevel,
+        keyMatches: `${keyMatches} / ${nCases}`,
+        keyMatchesOk: schemaOk,
+        nullCount,
+        numericOk,
+        numericFail,
+        coercionOk,
+        sampleValues,
+        coerceFails,
+        missingValues: meta.missingValues || [],
+        ok: schemaOk && coercionOk,
+      };
+    });
+
+    const schemaBad   = varReports.filter(r => !r.keyMatchesOk);
+    const coercionBad = varReports.filter(r => !r.coercionOk);
+    const s3ok = schemaBad.length === 0 && coercionBad.length === 0;
+    if (!s3ok) ok = false;
+
+    stages.push({
+      stage: 'S3_VARIABLES',
+      ok: s3ok,
+      variables: varReports,
+      schemaMismatches: schemaBad.length,
+      coercionFailures: coercionBad.length,
+      detail: schemaBad.length > 0
+        ? `Schema mismatch on: ${schemaBad.map(r=>r.name).join(', ')}`
+        : coercionBad.length > 0
+          ? `Numeric coercion failures on: ${coercionBad.map(r=>r.name).join(', ')}`
+          : 'All variables OK',
+    });
+
+    // ── S4: active filter / weight / split ───────────────────────
+    const activeFilter   = dataset.activeFilter   || null;
+    const weightVariable = dataset.weightVariable || null;
+    const splitVariables = dataset.splitVariables || [];
+    let filterMatchedCases = activeFilter ? null : nCases;
+    let filterOk = true;
+
+    if (activeFilter) {
+      try {
+        const allVarNames = dataset.variables.map(v => v.name);
+        const expr = activeFilter.replace(/\bAND\b/gi,'&&').replace(/\bOR\b/gi,'||').replace(/\bNOT\b/gi,'!');
+        // eslint-disable-next-line no-new-func
+        const fn = new Function(...allVarNames, `"use strict"; return !!(${expr});`);
+        filterMatchedCases = dataset.cases.filter(row => {
+          try { return fn(...allVarNames.map(vn => row[vn] ?? null)); } catch { return true; }
+        }).length;
+        if (filterMatchedCases === 0) filterOk = false;
+      } catch (e) {
+        filterOk = false;
+        filterMatchedCases = `ERROR: ${e.message}`;
+      }
+    }
+    if (!filterOk) ok = false;
+    stages.push({
+      stage: 'S4_FILTER',
+      ok: filterOk,
+      activeFilter: activeFilter || 'NONE',
+      filterMatchedCases,
+      weightVariable: weightVariable || 'NONE',
+      splitVariables: splitVariables.length ? splitVariables : 'NONE',
+      detail: !filterOk ? `CRITICAL: active filter matches 0 cases` : 'OK',
+    });
+
+    // ── S5: resolveDataset trace for first numeric variable ───────
+    const firstNumVar = dataset.variables.find(v => v.type === 'numeric');
+    let s5 = { stage: 'S5_RESOLVE', ok: true, detail: 'No numeric variable found' };
+    if (firstNumVar) {
+      try {
+        const resolved = Stats.resolveDataset(dataset, [firstNumVar.name], {});
+        const resolvedN = resolved.n;
+        const rawColLen = resolved.data[firstNumVar.name]?.length ?? 0;
+        s5 = {
+          stage: 'S5_RESOLVE',
+          ok: resolvedN > 0,
+          variable: firstNumVar.name,
+          resolvedN,
+          rawColLen,
+          warnings: resolved.warnings,
+          detail: resolvedN > 0 ? `N=${resolvedN}` : `CRITICAL: resolvedN=0 for "${firstNumVar.name}"`,
+        };
+        if (resolvedN === 0) ok = false;
+      } catch (e) {
+        s5 = { stage: 'S5_RESOLVE', ok: false, detail: `resolveDataset threw: ${e.message}` };
+        ok = false;
+      }
+    }
+    stages.push(s5);
+
+    // Determine first failure for fast diagnosis
+    const firstFailure = stages.find(s => !s.ok) || null;
+
+    return { ok, stages, firstFailure, dataset: { name: dataset.name, cases: nCases, variables: nVars } };
+  }
+
+  /* ── Stage 6: built-in self-test — bypasses import entirely ─── */
+  function selfTest() {
+    const results = {};
+
+    // Build a minimal test dataset entirely in JS — no CSV, no wizard
+    const testDataset = {
+      id: '__selftest__',
+      name: 'Pipeline Self-Test',
+      variables: [{
+        id: '__x__', name: 'x', label: 'x', type: 'numeric',
+        measurementLevel: 'scale', missingValues: [], valueLabels: {},
+        width: 8, decimals: 2, role: 'input', visibility: true
+      }],
+      cases: [{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }],
+      activeFilter: null, weightVariable: null, splitVariables: [],
+      metadata: {}, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    };
+
+    // T1: resolveDataset
+    try {
+      const resolved = Stats.resolveDataset(testDataset, ['x'], {});
+      const pass = resolved.n === 5 && resolved.data.x?.length === 5;
+      results.resolveDataset = {
+        pass,
+        resolvedN: resolved.n,
+        data: resolved.data.x,
+        detail: pass ? 'PASS — N=5' : `FAIL — got N=${resolved.n}, data=${JSON.stringify(resolved.data.x)}`
+      };
+    } catch (e) {
+      results.resolveDataset = { pass: false, detail: `THREW: ${e.message}` };
+    }
+
+    // T2: descriptives
+    try {
+      const desc = Stats.descriptives(testDataset, { variables: ['x'] });
+      const v = desc?.result?.descriptives?.x;
+      const passN    = v?.n === 5;
+      const passMean = v?.mean !== undefined && Math.abs(v.mean - 3) < 0.001;
+      const passMin  = v?.minimum === 1;
+      const passMax  = v?.maximum === 5;
+      const pass = passN && passMean && passMin && passMax;
+      results.descriptives = {
+        pass,
+        n: v?.n,
+        mean: v?.mean,
+        min: v?.minimum,
+        max: v?.maximum,
+        detail: pass ? 'PASS — N=5, mean=3, min=1, max=5'
+          : `FAIL — n=${v?.n}, mean=${v?.mean}, min=${v?.minimum}, max=${v?.maximum}, error=${v?.error || 'none'}`
+      };
+    } catch (e) {
+      results.descriptives = { pass: false, detail: `THREW: ${e.message}` };
+    }
+
+    // T3: schema check via DataIntegrity
+    try {
+      const integ = DataIntegrity.check(testDataset);
+      results.schemaCheck = {
+        pass: integ.ok,
+        detail: integ.ok ? 'PASS' : `FAIL — ${integ.variableReports?.[0]?.noKeysInCases ? 'NO CASE KEYS' : 'problem vars: ' + integ.problemVars?.map(v=>v.variable).join(',')}`
+      };
+    } catch (e) {
+      results.schemaCheck = { pass: false, detail: `THREW: ${e.message}` };
+    }
+
+    // T4: numeric coercion — stored as number (not string)
+    const firstCase = testDataset.cases[0];
+    const rawX = firstCase.x;
+    const typeofX = typeof rawX;
+    results.numericCoercion = {
+      pass: typeofX === 'number' && rawX === 1,
+      rawValue: rawX,
+      typeofValue: typeofX,
+      detail: typeofX === 'number' ? `PASS — typeof x = 'number'` : `FAIL — typeof x = '${typeofX}', value=${JSON.stringify(rawX)}`
+    };
+
+    // Overall
+    const allPass = Object.values(results).every(r => r.pass);
+    results._summary = {
+      pass: allPass,
+      conclusion: allPass
+        ? 'Pipeline OK — problem is in import layer or persisted data schema.'
+        : 'Pipeline itself has a bug — the statistical engine or resolver is broken.'
+    };
+
+    return results;
+  }
+
+  /* ── Plain-text console output ──────────────────────────────── */
+  function printInspect(dataset) {
+    const r = inspect(dataset);
+    const lines = [
+      '╔══ DATA PIPELINE INSPECTOR ══╗',
+      `Dataset: ${r.dataset?.name ?? '(none)'}`,
+      `Cases: ${r.dataset?.cases ?? '—'}`,
+      `Variables: ${r.dataset?.variables ?? '—'}`,
+      `Overall: ${r.ok ? 'PASS ✓' : 'FAIL ✗'}`,
+      '',
+    ];
+    r.stages.forEach(s => {
+      lines.push(`[${s.ok === false ? 'FAIL' : s.ok === true ? 'PASS' : '....'}] ${s.stage}: ${s.detail || ''}`);
+      if (s.stage === 'S2_RAW_CASES' && s.sampleCases) {
+        s.sampleCases.forEach(c => {
+          lines.push(`  Case ${c.index}: ${JSON.stringify(c.values)}`);
+        });
+      }
+      if (s.stage === 'S3_VARIABLES' && s.variables) {
+        s.variables.forEach(v => {
+          const flag = v.ok ? '✓' : '✗';
+          lines.push(`  ${flag} ${v.name} [${v.type}] keys:${v.keyMatches} numOk:${v.numericOk} numFail:${v.numericFail} null:${v.nullCount}`);
+          if (v.coerceFails.length > 0) {
+            v.coerceFails.forEach(f => lines.push(`    ⚠ coerce fail: ${JSON.stringify(f)}`));
+          }
+          if (v.sampleValues.length > 0) {
+            lines.push(`    sample: ${v.sampleValues.map(s=>`${JSON.stringify(s.raw)}(${s.type})`).join(', ')}`);
+          }
+        });
+      }
+    });
+    if (r.firstFailure) {
+      lines.push('');
+      lines.push(`FIRST FAILURE: ${r.firstFailure.stage} — ${r.firstFailure.detail}`);
+    }
+    const text = lines.join('\n');
+    console.log(text);
+    return text;
+  }
+
+  function printSelfTest() {
+    const r = selfTest();
+    const lines = ['╔══ PIPELINE SELF-TEST ══╗'];
+    Object.entries(r).forEach(([k, v]) => {
+      if (k === '_summary') return;
+      lines.push(`[${v.pass ? 'PASS' : 'FAIL'}] ${k}: ${v.detail}`);
+    });
+    lines.push('');
+    lines.push(`CONCLUSION: ${r._summary.conclusion}`);
+    const text = lines.join('\n');
+    console.log(text);
+    return r;
+  }
+
+  return { inspect, selfTest, printInspect, printSelfTest };
+})();
+
+/* ══════════════════════════════════════════════════════════════════
+   SECTION 4B-CONV: DATA TYPE CONVERTER
+   parseSemanticNumber  — locale-aware, currency-aware value parser
+   DataTypeConverter    — preview + case-level type conversion
+   ══════════════════════════════════════════════════════════════════ */
+
+const DataTypeConverter = (() => {
+
+  /* ─────────────────────────────────────────────────────────────
+     parseSemanticNumber(raw)
+     Attempts to extract a JS number from a raw value that may be:
+       • plain integer / decimal         "42000"  "42000.50"
+       • US thousands                    "57,636"  "57,636.56"
+       • EU/ID thousands                 "57.636"  "57.636,56"
+       • Currency USD                    "$57.636,56"  "$57,636.56"
+       • Currency IDR                    "Rp 57.636.560"  "Rp57.636,56"
+       • Percentage                      "72.5%"  "72,5%"
+       • Already a number                57636.56
+     Returns { value: number, format: 'plain'|'currency_usd'|'currency_idr'|'percent'|'thousands_eu'|'thousands_us', original: raw }
+     Returns null when value cannot be safely parsed.
+  ───────────────────────────────────────────────────────────────── */
+  function parseSemanticNumber(raw) {
+    if (raw === null || raw === undefined || raw === '') return null;
+    if (typeof raw === 'number') return isFinite(raw) ? { value: raw, format: 'plain', original: raw } : null;
+    if (typeof raw === 'boolean') return { value: raw ? 1 : 0, format: 'plain', original: raw };
+
+    let s = String(raw).trim();
+    if (s === '') return null;
+
+    let format = 'plain';
+    let isNegative = false;
+
+    // Leading minus / parentheses for accounting negatives: (1.234)
+    if (s.startsWith('-')) { isNegative = true; s = s.slice(1).trim(); }
+    else if (s.startsWith('(') && s.endsWith(')')) { isNegative = true; s = s.slice(1, -1).trim(); }
+
+    // Strip currency prefix
+    const usdPfx = /^\$\s*/;
+    const idrPfx = /^Rp\.?\s*/i;
+    if (usdPfx.test(s)) { s = s.replace(usdPfx, ''); format = 'currency_usd'; }
+    else if (idrPfx.test(s)) { s = s.replace(idrPfx, ''); format = 'currency_idr'; }
+
+    // Strip percent suffix
+    let isPct = false;
+    if (s.endsWith('%')) { s = s.slice(0, -1).trim(); isPct = true; if (format === 'plain') format = 'percent'; }
+
+    // Now s should be a numeric string potentially with separators.
+    // Detect EU notation:  digits with . as thousands separator and , as decimal
+    //   Pattern: contains comma AND last group after comma is 1 or 2 digits
+    //   (not 3, which would be thousands) OR has no comma but has .XXX groups
+    // Detect US notation:  digits with , as thousands separator and . as decimal
+
+    let normalised = '';
+    const hasComma = s.includes(',');
+    const hasDot   = s.includes('.');
+
+    if (hasComma && hasDot) {
+      // Both present — determine which is thousands and which is decimal
+      const lastCommaIdx = s.lastIndexOf(',');
+      const lastDotIdx   = s.lastIndexOf('.');
+      if (lastDotIdx > lastCommaIdx) {
+        // dot is last → US style: "57,636.56" or "1,234.5"
+        normalised = s.replace(/,/g, '');
+        if (format === 'plain') format = 'thousands_us';
+      } else {
+        // comma is last → EU style: "57.636,56" or "1.234,5"
+        normalised = s.replace(/\./g, '').replace(',', '.');
+        if (format === 'plain') format = 'thousands_eu';
+      }
+    } else if (hasComma && !hasDot) {
+      // Only comma — could be EU decimal ("57,5") or US thousands ("57,636")
+      const parts = s.split(',');
+      const lastPart = parts[parts.length - 1];
+      if (parts.length === 2 && lastPart.length !== 3) {
+        // EU decimal: "57,5" or "1234,56"
+        normalised = parts[0] + '.' + lastPart;
+        if (format === 'plain') format = 'thousands_eu';
+      } else {
+        // US thousands: "57,636" or "1,234,567"
+        normalised = s.replace(/,/g, '');
+        if (format === 'plain') format = 'thousands_us';
+      }
+    } else if (!hasComma && hasDot) {
+      // Only dot — could be EU thousands ("57.636") or plain decimal ("57.636" is ambiguous)
+      const parts = s.split('.');
+      const lastPart = parts[parts.length - 1];
+      if (parts.length > 2) {
+        // Multiple dots — must be EU thousands: "1.234.567"
+        normalised = s.replace(/\./g, '');
+        if (format === 'plain') format = 'thousands_eu';
+      } else if (parts.length === 2 && lastPart.length === 3 && /^\d+$/.test(parts[0]) && /^\d+$/.test(lastPart) && parts[0].length >= 1) {
+        // Ambiguous: "57.636" could be EU thousands 57636 or decimal 57.636
+        // For currency/known formats, treat as thousands; otherwise treat as decimal
+        if (format === 'currency_usd' || format === 'currency_idr') {
+          normalised = s.replace(/\./g, '');
+        } else {
+          // Default: treat as plain decimal
+          normalised = s;
+        }
+      } else {
+        // Plain decimal: "3.14" or "57.5"
+        normalised = s;
+      }
+    } else {
+      // No separators
+      normalised = s;
+    }
+
+    // After normalisation, must be a valid float
+    if (!/^-?\d+(\.\d+)?$/.test(normalised)) return null;
+    const num = parseFloat(normalised);
+    if (!isFinite(num)) return null;
+
+    let value = isNegative ? -num : num;
+    if (isPct) value = value / 100;
+
+    return { value, format, original: raw };
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     detectColumnFormat(values)
+     Examines a column of raw values and returns a summary:
+       { numericCount, invalidCount, totalCount, format, canConvert }
+  ───────────────────────────────────────────────────────────────── */
+  function detectColumnFormat(values) {
+    const nonEmpty = values.filter(v => v !== null && v !== undefined && v !== '');
+    const totalCount = values.length;
+    let numericCount = 0, invalidCount = 0;
+    const formatCounts = {};
+    nonEmpty.forEach(v => {
+      const r = parseSemanticNumber(v);
+      if (r !== null) {
+        numericCount++;
+        formatCounts[r.format] = (formatCounts[r.format] || 0) + 1;
+      } else {
+        invalidCount++;
+      }
+    });
+    // Dominant format
+    const dominantFormat = Object.entries(formatCounts).sort((a,b)=>b[1]-a[1])[0]?.[0] || 'plain';
+    return {
+      totalCount,
+      nonEmptyCount: nonEmpty.length,
+      numericCount,
+      invalidCount,
+      missingCount: totalCount - nonEmpty.length,
+      format: dominantFormat,
+      canConvert: nonEmpty.length > 0 && invalidCount === 0,
+      canConvertPartial: numericCount > 0,
+    };
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     previewConversion(dataset, varName, targetType)
+     Returns a preview object for the confirmation dialog.
+  ───────────────────────────────────────────────────────────────── */
+  function previewConversion(dataset, varName, targetType) {
+    const v = dataset.variables.find(x => x.name === varName);
+    if (!v) return { error: 'Variable not found: ' + varName };
+    const currentType = v.type;
+    if (currentType === targetType) return { noChange: true };
+
+    const rawValues = dataset.cases.map(row => row[varName]);
+    const preview = [];
+    let validCount = 0, invalidCount = 0;
+
+    if (targetType === 'numeric') {
+      rawValues.forEach(raw => {
+        if (raw === null || raw === undefined || raw === '') {
+          preview.push({ original: raw, converted: null, valid: true, wasMissing: true });
+          return;
+        }
+        const r = parseSemanticNumber(raw);
+        if (r !== null) {
+          validCount++;
+          preview.push({ original: raw, converted: r.value, valid: true, format: r.format });
+        } else {
+          invalidCount++;
+          preview.push({ original: raw, converted: null, valid: false });
+        }
+      });
+      const { format } = detectColumnFormat(rawValues.filter(v=>v!=null&&v!=''));
+      return {
+        varName, currentType, targetType,
+        format, totalCount: rawValues.length, validCount, invalidCount,
+        preview: preview.slice(0, 10),
+        canConvert: invalidCount === 0,
+        canConvertPartial: validCount > 0,
+      };
+    }
+
+    if (targetType === 'string') {
+      rawValues.forEach(raw => {
+        if (raw === null || raw === undefined) {
+          preview.push({ original: raw, converted: null, valid: true, wasMissing: true });
+          return;
+        }
+        const converted = String(raw);
+        validCount++;
+        preview.push({ original: raw, converted, valid: true });
+      });
+      return {
+        varName, currentType, targetType,
+        totalCount: rawValues.length, validCount, invalidCount: 0,
+        preview: preview.slice(0, 10),
+        canConvert: true, canConvertPartial: true,
+      };
+    }
+
+    if (targetType === 'date') {
+      const dateFormats = [
+        { rx: /^\d{4}-\d{2}-\d{2}$/, label: 'ISO (YYYY-MM-DD)' },
+        { rx: /^\d{2}\/\d{2}\/\d{4}$/, label: 'MM/DD/YYYY' },
+        { rx: /^\d{2}-\d{2}-\d{4}$/, label: 'DD-MM-YYYY' },
+      ];
+      rawValues.forEach(raw => {
+        if (raw === null || raw === undefined || raw === '') {
+          preview.push({ original: raw, converted: null, valid: true, wasMissing: true });
+          return;
+        }
+        const s = String(raw).trim();
+        const d = new Date(s);
+        if (!isNaN(d.getTime())) {
+          validCount++;
+          preview.push({ original: raw, converted: d.toISOString().slice(0, 10), valid: true });
+        } else {
+          invalidCount++;
+          preview.push({ original: raw, converted: null, valid: false });
+        }
+      });
+      return {
+        varName, currentType, targetType,
+        totalCount: rawValues.length, validCount, invalidCount,
+        preview: preview.slice(0, 10),
+        canConvert: invalidCount === 0, canConvertPartial: validCount > 0,
+      };
+    }
+
+    if (targetType === 'boolean') {
+      const trueVals = new Set(['true','yes','1','y','t']);
+      const falseVals = new Set(['false','no','0','n','f']);
+      rawValues.forEach(raw => {
+        if (raw === null || raw === undefined || raw === '') {
+          preview.push({ original: raw, converted: null, valid: true, wasMissing: true });
+          return;
+        }
+        const s = String(raw).trim().toLowerCase();
+        if (trueVals.has(s)) { validCount++; preview.push({ original: raw, converted: true, valid: true }); }
+        else if (falseVals.has(s)) { validCount++; preview.push({ original: raw, converted: false, valid: true }); }
+        else { invalidCount++; preview.push({ original: raw, converted: null, valid: false }); }
+      });
+      return {
+        varName, currentType, targetType,
+        totalCount: rawValues.length, validCount, invalidCount,
+        preview: preview.slice(0, 10),
+        canConvert: invalidCount === 0, canConvertPartial: validCount > 0,
+      };
+    }
+
+    return { varName, currentType, targetType, noOp: true };
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     convertVariable(dataset, varName, targetType, onInvalid)
+     Performs the actual in-place conversion.
+     onInvalid: 'missing' (default) | 'cancel'
+     Returns { converted, skipped, errors }
+  ───────────────────────────────────────────────────────────────── */
+  function convertVariable(dataset, varName, targetType, onInvalid = 'missing') {
+    const vIdx = dataset.variables.findIndex(x => x.name === varName);
+    if (vIdx < 0) return { error: 'Variable not found: ' + varName };
+    const v = dataset.variables[vIdx];
+    const prev = previewConversion(dataset, varName, targetType);
+
+    if (prev.error) return prev;
+    if (prev.noChange || prev.noOp) return { converted: 0, skipped: 0, errors: 0 };
+
+    if (onInvalid === 'cancel' && prev.invalidCount > 0) {
+      return { error: `Conversion cancelled: ${prev.invalidCount} values could not be converted.` };
+    }
+
+    // Snapshot old values for undo support
+    const oldValues = dataset.cases.map(row => row[varName]);
+    const oldType = v.type;
+    const oldLevel = v.measurementLevel;
+
+    let converted = 0, skipped = 0, errors = 0;
+
+    dataset.cases.forEach(row => {
+      const raw = row[varName];
+      if (raw === null || raw === undefined || raw === '') return; // keep missing
+
+      if (targetType === 'numeric') {
+        const r = parseSemanticNumber(raw);
+        if (r !== null) { row[varName] = r.value; converted++; }
+        else { row[varName] = null; errors++; }
+      } else if (targetType === 'string') {
+        row[varName] = (raw === null || raw === undefined) ? null : String(raw);
+        converted++;
+      } else if (targetType === 'date') {
+        const d = new Date(String(raw).trim());
+        if (!isNaN(d.getTime())) { row[varName] = d.toISOString().slice(0, 10); converted++; }
+        else { row[varName] = null; errors++; }
+      } else if (targetType === 'boolean') {
+        const s = String(raw).trim().toLowerCase();
+        const trueVals = new Set(['true','yes','1','y','t']);
+        const falseVals = new Set(['false','no','0','n','f']);
+        if (trueVals.has(s)) { row[varName] = true; converted++; }
+        else if (falseVals.has(s)) { row[varName] = false; converted++; }
+        else { row[varName] = null; errors++; }
+      } else {
+        skipped++;
+      }
+    });
+
+    // Update metadata
+    v.type = targetType;
+    if (targetType === 'numeric') {
+      v.measurementLevel = v.measurementLevel === 'nominal' ? 'scale' : v.measurementLevel || 'scale';
+    } else if (targetType === 'string') {
+      v.measurementLevel = v.measurementLevel === 'scale' ? 'nominal' : v.measurementLevel || 'nominal';
+    } else if (targetType === 'date' || targetType === 'datetime') {
+      v.measurementLevel = 'nominal';
+    }
+
+    dataset.updatedAt = new Date().toISOString();
+
+    // Register in History for audit trail (not full undo — just a record)
+    if (typeof History !== 'undefined') {
+      History.addEntry({
+        type: 'typeConversion',
+        varName, oldType, newType: targetType, oldLevel,
+        newLevel: v.measurementLevel,
+        converted, errors,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    return {
+      converted, skipped, errors,
+      // Expose restore function for manual undo if needed
+      restore: () => {
+        oldValues.forEach((val, i) => { if (i < dataset.cases.length) dataset.cases[i][varName] = val; });
+        v.type = oldType;
+        v.measurementLevel = oldLevel;
+        dataset.updatedAt = new Date().toISOString();
+      }
+    };
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     showConversionDialog(dataset, varName, targetType, onConfirm)
+     Renders the preview + confirm dialog.
+  ───────────────────────────────────────────────────────────────── */
+  function showConversionDialog(dataset, varName, targetType, onConfirm) {
+    const prev = previewConversion(dataset, varName, targetType);
+    if (prev.noChange) { onConfirm && onConfirm('nochange'); return; }
+    if (prev.noOp) { onConfirm && onConfirm('noop'); return; }
+
+    const overlay = el('div', { class: 'dialog-overlay', id: 'type-conv-overlay' });
+    const box = el('div', { class: 'dialog-box', style: { maxWidth: '560px' } });
+
+    box.appendChild(el('div', { class: 'dialog-header' },
+      el('h3', {}, 'Convert Variable Type'),
+      el('button', { class: 'dialog-close', onclick: () => overlay.remove() }, '×')
+    ));
+
+    const body = el('div', { class: 'dialog-body' });
+
+    // Summary banner
+    const fmtLabel = {
+      currency_usd: 'USD currency',
+      currency_idr: 'IDR currency',
+      percent: 'Percentage (%)',
+      thousands_us: 'US number format (1,234.56)',
+      thousands_eu: 'European/Indonesian number format (1.234,56)',
+      plain: 'Plain number',
+    }[prev.format] || prev.format || '';
+
+    body.appendChild(el('div', { class: 'conv-summary' },
+      el('div', { class: 'conv-row' }, el('span', { class: 'conv-lbl' }, 'Variable'), el('span', { class: 'conv-val' }, varName)),
+      el('div', { class: 'conv-row' }, el('span', { class: 'conv-lbl' }, 'Current type'), el('span', { class: 'conv-val' }, prev.currentType)),
+      el('div', { class: 'conv-row' }, el('span', { class: 'conv-lbl' }, 'Target type'), el('span', { class: 'conv-val conv-val-new' }, targetType)),
+      fmtLabel ? el('div', { class: 'conv-row' }, el('span', { class: 'conv-lbl' }, 'Detected format'), el('span', { class: 'conv-val' }, fmtLabel)) : null
+    ));
+
+    // Stats
+    body.appendChild(el('div', { class: 'conv-stats' },
+      el('span', { class: 'conv-stat-valid' }, `✓ Valid: ${prev.validCount}`),
+      el('span', { style: { margin: '0 8px' } }, '|'),
+      el('span', { class: prev.invalidCount > 0 ? 'conv-stat-invalid' : '' }, `✗ Invalid: ${prev.invalidCount}`),
+      el('span', { style: { margin: '0 8px' } }, '|'),
+      el('span', {}, `Total: ${prev.totalCount}`)
+    ));
+
+    // Preview table
+    if (prev.preview && prev.preview.length > 0) {
+      body.appendChild(el('div', { class: 'conv-preview-title' }, 'Preview (first 10 values):'));
+      const tbl = el('table', { class: 'pivot-table conv-preview-tbl' });
+      tbl.appendChild(el('thead', {}, el('tr', {},
+        el('th', {}, 'Original'), el('th', {}, '→'), el('th', {}, 'Converted'), el('th', {}, 'Status')
+      )));
+      const tbody = el('tbody');
+      prev.preview.forEach(row => {
+        if (row.wasMissing) return;
+        const statusEl = row.valid
+          ? el('td', { style: { color: '#15803d', fontWeight: '700' } }, '✓')
+          : el('td', { style: { color: '#dc2626', fontWeight: '700' } }, '✗ invalid');
+        tbody.appendChild(el('tr', {},
+          el('td', { style: { fontFamily: 'monospace', fontSize: '11px' } }, String(row.original)),
+          el('td', { style: { color: '#9ca3af' } }, '→'),
+          el('td', { style: { fontFamily: 'monospace', fontSize: '11px', color: row.valid ? '#1f2328' : '#dc2626' } },
+            row.valid && row.converted !== null ? String(row.converted) : (row.valid ? '(missing)' : '—')),
+          statusEl
+        ));
+      });
+      tbl.appendChild(tbody);
+      body.appendChild(tbl);
+    }
+
+    // Invalid handling option
+    let onInvalidVal = 'missing';
+    if (prev.invalidCount > 0) {
+      body.appendChild(el('div', { class: 'conv-invalid-section' },
+        el('p', { style: { color: '#92400e', marginBottom: '8px' } },
+          `⚠ ${prev.invalidCount} value(s) cannot be converted to ${targetType}.`),
+        el('div', { class: 'conv-radio-group' },
+          ...['missing', 'cancel'].map(opt => {
+            const lbl = opt === 'missing' ? 'Set invalid values as system missing (null)' : 'Cancel — do not convert';
+            const inp = el('input', { type: 'radio', name: 'conv-invalid', value: opt, checked: opt === 'missing' });
+            inp.addEventListener('change', () => { onInvalidVal = opt; });
+            return el('label', { class: 'conv-radio-label' }, inp, ' ' + lbl);
+          })
+        )
+      ));
+    }
+
+    box.appendChild(body);
+
+    box.appendChild(el('div', { class: 'dialog-footer' },
+      el('button', { class: 'btn btn-secondary', onclick: () => overlay.remove() }, 'Cancel'),
+      el('button', {
+        class: 'btn btn-primary',
+        onclick: () => {
+          overlay.remove();
+          if (onConfirm) onConfirm(onInvalidVal);
+        }
+      }, 'Convert')
+    ));
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+  }
+
+  return { parseSemanticNumber, detectColumnFormat, previewConversion, convertVariable, showConversionDialog };
+})();
+
+/* ══════════════════════════════════════════════════════════════════
+   SECTION 4C: PROBABILITY & DISTRIBUTION ENGINE
+   Reuses Stats.normCdf — does not re-implement normal distribution.
+   ══════════════════════════════════════════════════════════════════ */
+
+const ProbabilityCalc = (() => {
+
+  /* ── Re-use Stats.normCdf ── */
+  const normCdf = (z) => Stats.normCdf(z);
+
+  /* ── Standard Normal Z-table (Abramowitz & Stegun 26.2.17)
+     Table stores P(Z ≤ z) for z = 0.00..3.99 in steps of 0.01.
+     Row = tenths digit (e.g. 1.9), Column = hundredths digit (e.g. .06) → 1.96
+     Only first 4 decimals shown here (matches textbook Z-tables).
+     Lookup is done via the exact-computation normCdf when available,
+     and the prebuilt table is used when user explicitly selects "Z Table" mode.
+  ── */
+  const Z_TABLE = (() => {
+    // Build a compact lookup: key = "R.C" where R*10+C = z*100
+    // We generate the table from normCdf to guarantee accuracy and avoid
+    // a 400-entry hard-coded array.  This is run once at startup.
+    const tbl = {};
+    for (let ri = 0; ri <= 39; ri++) {
+      for (let ci = 0; ci <= 9; ci++) {
+        const z = (ri * 10 + ci) / 100;   // 0.00 to 3.99
+        const p = normCdf(z);
+        tbl[`${ri}.${ci}`] = parseFloat(p.toFixed(4));
+        // Also store negative keys (use symmetry)
+        tbl[`-${ri}.${ci}`] = parseFloat((1 - p).toFixed(4));
+      }
+    }
+    return tbl;
+  })();
+
+  /* ── Lookup P(Z ≤ z) from table, precision to 0.01 ── */
+  function tablelookup(z) {
+    const z2 = Math.abs(z);
+    if (z2 > 3.99) return z >= 0 ? 1 : 0;
+    const ri = Math.round(Math.floor(z2 * 10));    // tenths
+    const ci = Math.round(Math.round((z2 * 100) % 10)); // hundredths
+    const key = `${ri}.${ci}`;
+    const p = Z_TABLE[key] != null ? Z_TABLE[key] : parseFloat(normCdf(z2).toFixed(4));
+    return z >= 0 ? p : parseFloat((1 - p).toFixed(4));
+  }
+
+  /* ── Inverse Normal (probit) — needed for critical Z ── */
+  function normInv(p) {
+    if (typeof jStat !== 'undefined') return jStat.normal.inv(p, 0, 1);
+    // Rational approximation (Abramowitz & Stegun 26.2.23)
+    if (p <= 0) return -Infinity;
+    if (p >= 1) return Infinity;
+    if (p > 0.5) return -normInv(1 - p);
+    const t = Math.sqrt(-2 * Math.log(p));
+    const c = [2.515517, 0.802853, 0.010328];
+    const d = [1.432788, 0.189269, 0.001308];
+    return -(t - (c[0] + c[1]*t + c[2]*t*t) / (1 + d[0]*t + d[1]*t*t + d[2]*t*t*t));
+  }
+
+  /* ── Core calculation ── */
+  function calculateNormal(opts) {
+    /*
+      opts = {
+        mode:       'z' | 'raw',        // Z-score or raw X
+        z:          number,              // used when mode='z'
+        x:          number,              // used when mode='raw'
+        mean:       number,              // used when mode='raw'
+        sd:         number,              // used when mode='raw' (must be > 0)
+        tailType:   'left'|'right'|'between'|'two',
+        z1:         number,              // used for 'between'
+        z2:         number,              // used for 'between'
+        x1:         number,              // raw X1 for 'between' in raw mode
+        x2:         number,              // raw X2 for 'between' in raw mode
+        method:     'exact'|'table',
+      }
+    */
+    const { mode='z', tailType='left', method='exact' } = opts;
+
+    // ── Validate ──
+    const errors = [];
+    let z = null, z1 = null, z2 = null;
+
+    if (tailType === 'between') {
+      if (mode === 'raw') {
+        // Validate raw-between inputs
+        if (opts.x1 == null || isNaN(Number(opts.x1))) errors.push('x1 must be numeric');
+        if (opts.x2 == null || isNaN(Number(opts.x2))) errors.push('x2 must be numeric');
+        if (opts.mean == null || isNaN(Number(opts.mean))) errors.push('Mean must be numeric');
+        if (opts.sd == null || isNaN(Number(opts.sd))) errors.push('Standard deviation must be numeric');
+        if (Number(opts.sd) <= 0) errors.push('Standard deviation must be greater than 0');
+        if (errors.length) return { error: errors.join('; ') };
+        z1 = (Number(opts.x1) - Number(opts.mean)) / Number(opts.sd);
+        z2 = (Number(opts.x2) - Number(opts.mean)) / Number(opts.sd);
+      } else {
+        if (opts.z1 == null || isNaN(Number(opts.z1))) errors.push('z1 must be numeric');
+        if (opts.z2 == null || isNaN(Number(opts.z2))) errors.push('z2 must be numeric');
+        if (errors.length) return { error: errors.join('; ') };
+        z1 = Number(opts.z1);
+        z2 = Number(opts.z2);
+      }
+      // ensure z1 < z2
+      if (z1 > z2) { [z1, z2] = [z2, z1]; }
+    } else {
+      if (mode === 'raw') {
+        if (opts.x == null || isNaN(Number(opts.x))) errors.push('X must be numeric');
+        if (opts.mean == null || isNaN(Number(opts.mean))) errors.push('Mean must be numeric');
+        if (opts.sd == null || isNaN(Number(opts.sd))) errors.push('Standard deviation must be numeric');
+        if (Number(opts.sd) <= 0) errors.push('Standard deviation must be greater than 0');
+        if (errors.length) return { error: errors.join('; ') };
+        z = (Number(opts.x) - Number(opts.mean)) / Number(opts.sd);
+      } else {
+        if (opts.z == null || isNaN(Number(opts.z))) errors.push('Z must be numeric');
+        if (errors.length) return { error: errors.join('; ') };
+        z = Number(opts.z);
+      }
+    }
+
+    // ── Compute probabilities ──
+    function getP(zVal) {
+      return method === 'table' ? tableloop(zVal) : normCdf(zVal);
+    }
+    function tableloop(zVal) { return tableloop_inner(zVal); }
+    function tableloop_inner(zVal) { return tableonly(zVal); }
+    function tableonly(zVal) {
+      const z2 = Math.abs(zVal);
+      if (z2 > 3.99) return zVal >= 0 ? 1 : 0;
+      const ri = Math.floor(z2 * 10);
+      const ci = Math.round((z2 * 100) % 10);
+      const key = `${ri}.${ci}`;
+      const p = Z_TABLE[key] != null ? Z_TABLE[key] : parseFloat(normCdf(z2).toFixed(4));
+      return zVal >= 0 ? p : parseFloat((1 - p).toFixed(4));
+    }
+
+    let probability, leftP, rightP, betweenP;
+
+    if (tailType === 'between') {
+      leftP = getP(z1);
+      rightP = 1 - getP(z2);
+      betweenP = 1 - leftP - rightP;
+      probability = Math.max(0, Math.min(1, betweenP));
+    } else if (tailType === 'left') {
+      probability = getP(z);
+      leftP = probability;
+      rightP = 1 - probability;
+    } else if (tailType === 'right') {
+      probability = 1 - getP(z);
+      leftP = getP(z);
+      rightP = probability;
+    } else if (tailType === 'two') {
+      // P(|Z| >= |z|)
+      leftP = getP(-Math.abs(z));
+      rightP = 1 - getP(Math.abs(z));
+      probability = leftP + rightP;
+    }
+
+    // ── Table value (always 4 decimal places) ──
+    let tableValue = null;
+    if (tailType === 'between') {
+      tableValue = parseFloat((tableonly(z2) - tableonly(z1)).toFixed(4));
+    } else if (tailType === 'left') {
+      tableValue = tableonly(z);
+    } else if (tailType === 'right') {
+      tableValue = parseFloat((1 - tableonly(z)).toFixed(4));
+    } else if (tailType === 'two') {
+      tableValue = parseFloat((2 * tableonly(-Math.abs(z))).toFixed(4));
+    }
+
+    // ── Build result object ──
+    const result = {
+      distribution: 'normal',
+      mode,
+      z: tailType === 'between' ? null : parseFloat((z || 0).toFixed(6)),
+      z1: tailType === 'between' ? parseFloat(z1.toFixed(6)) : null,
+      z2: tailType === 'between' ? parseFloat(z2.toFixed(6)) : null,
+      type: tailType,
+      probability: parseFloat(Math.max(0, Math.min(1, probability)).toFixed(7)),
+      percentage: parseFloat((Math.max(0, Math.min(1, probability)) * 100).toFixed(5)),
+      tableValue,
+      method,
+    };
+
+    if (mode === 'raw') {
+      result.x = tailType === 'between' ? null : parseFloat(Number(opts.x).toFixed(6));
+      result.x1 = tailType === 'between' ? parseFloat(Number(opts.x1).toFixed(6)) : null;
+      result.x2 = tailType === 'between' ? parseFloat(Number(opts.x2).toFixed(6)) : null;
+      result.mean = parseFloat(Number(opts.mean).toFixed(6));
+      result.sd = parseFloat(Number(opts.sd).toFixed(6));
+    }
+
+    // Additional breakdown for convenience
+    result.leftTail  = parseFloat(Math.max(0, Math.min(1, tailType === 'between' ? leftP : getP(tailType === 'two' ? -Math.abs(z) : z))).toFixed(7));
+    result.rightTail = parseFloat(Math.max(0, Math.min(1, tailType === 'between' ? rightP : 1 - getP(tailType === 'two' ? Math.abs(z) : z))).toFixed(7));
+
+    return result;
+  }
+
+  /* ── Critical Value: given probability, find Z ── */
+  function criticalZ(opts) {
+    /*
+      opts = {
+        probability: number (0 < p < 1),
+        tailType: 'left' | 'right' | 'two-confidence' | 'two-alpha'
+      }
+      'two-confidence': p is confidence level (e.g. 0.95) → Z for each tail = normInv((1+p)/2)
+      'two-alpha':      p is alpha (e.g. 0.05) → Z_crit = normInv(1 - p/2)
+      'left':           p is left-tail probability → Z = normInv(p)
+      'right':          p is right-tail probability → Z = normInv(1-p)
+    */
+    const p = Number(opts.probability);
+    const tailType = opts.tailType || 'left';
+    if (isNaN(p) || p <= 0 || p >= 1) return { error: 'Probability must be between 0 and 1 (exclusive)' };
+
+    let z, label;
+    if (tailType === 'left') {
+      z = normInv(p);
+      label = `Z for P(Z ≤ z) = ${p}`;
+    } else if (tailType === 'right') {
+      z = normInv(1 - p);
+      label = `Z for P(Z > z) = ${p}`;
+    } else if (tailType === 'two-confidence') {
+      z = normInv((1 + p) / 2);
+      label = `Z_α/2 for ${(p*100).toFixed(0)}% CI`;
+    } else {  // two-alpha
+      z = normInv(1 - p / 2);
+      label = `Z_α/2 for α = ${p}`;
+    }
+
+    return {
+      distribution: 'normal',
+      mode: 'critical',
+      inputProbability: p,
+      tailType,
+      z: parseFloat(z.toFixed(6)),
+      label,
+      verification: parseFloat(normCdf(z).toFixed(7)),
+    };
+  }
+
+  /* ── P-value from Z ── */
+  function pValueFromZ(opts) {
+    /*
+      opts = { z: number, alternative: 'two-sided'|'left'|'right' }
+    */
+    const z = Number(opts.z);
+    const alt = opts.alternative || 'two-sided';
+    if (isNaN(z)) return { error: 'Z must be numeric' };
+
+    let pValue;
+    if (alt === 'two-sided') pValue = 2 * Math.min(normCdf(z), normCdf(-z));
+    else if (alt === 'left')  pValue = normCdf(z);
+    else                      pValue = 1 - normCdf(z);
+
+    return {
+      distribution: 'normal',
+      mode: 'pvalue',
+      z: parseFloat(z.toFixed(6)),
+      alternative: alt,
+      pValue: parseFloat(Math.max(0, Math.min(1, pValue)).toFixed(7)),
+      significant_05: pValue < 0.05,
+      significant_01: pValue < 0.01,
+      significant_001: pValue < 0.001,
+    };
+  }
+
+  /* ── Store last result (for Output export) ── */
+  let _lastResult = null;
+  function getLastResult() { return _lastResult; }
+  function setLastResult(r) { _lastResult = r; }
+
+  return { calculateNormal, criticalZ, pValueFromZ, normInv, normCdf, tableonly: (z) => {
+    const z2=Math.abs(z); if(z2>3.99)return z>=0?1:0;
+    const ri=Math.floor(z2*10); const ci=Math.round((z2*100)%10);
+    const key=`${ri}.${ci}`; const p=Z_TABLE[key]!=null?Z_TABLE[key]:parseFloat(Stats.normCdf(z2).toFixed(4));
+    return z>=0?p:parseFloat((1-p).toFixed(4));
+  }, getLastResult, setLastResult };
+})();
+
+/* ══════════════════════════════════════════════════════════════════
+   SECTION 4C: STUDENT'S t DISTRIBUTION ENGINE
+   ══════════════════════════════════════════════════════════════════ */
+
+const StudentTCalc = (() => {
+
+  /* ── Reference table from "t Student" sheet (Tabel_Nilai_Kritis)
+     Keys: df → { 0.25, 0.10, 0.05, 0.025, 0.01 }  (one-tailed alphas)
+  ── */
+  const T_TABLE = {
+    1:  { 0.25: 1.000, 0.10: 3.078, 0.05: 6.314, 0.025: 12.706, 0.01: 31.821 },
+    2:  { 0.25: 0.816, 0.10: 1.886, 0.05: 2.920, 0.025:  4.303, 0.01:  6.965 },
+    3:  { 0.25: 0.765, 0.10: 1.638, 0.05: 2.353, 0.025:  3.182, 0.01:  4.541 },
+    4:  { 0.25: 0.741, 0.10: 1.533, 0.05: 2.132, 0.025:  2.776, 0.01:  3.747 },
+    5:  { 0.25: 0.727, 0.10: 1.476, 0.05: 2.015, 0.025:  2.571, 0.01:  3.365 },
+    6:  { 0.25: 0.718, 0.10: 1.440, 0.05: 1.943, 0.025:  2.447, 0.01:  3.143 },
+    7:  { 0.25: 0.711, 0.10: 1.415, 0.05: 1.895, 0.025:  2.365, 0.01:  2.998 },
+    8:  { 0.25: 0.706, 0.10: 1.397, 0.05: 1.860, 0.025:  2.306, 0.01:  2.896 },
+    9:  { 0.25: 0.703, 0.10: 1.383, 0.05: 1.833, 0.025:  2.262, 0.01:  2.821 },
+    10: { 0.25: 0.700, 0.10: 1.372, 0.05: 1.812, 0.025:  2.228, 0.01:  2.764 },
+    11: { 0.25: 0.697, 0.10: 1.363, 0.05: 1.796, 0.025:  2.201, 0.01:  2.718 },
+    12: { 0.25: 0.695, 0.10: 1.356, 0.05: 1.782, 0.025:  2.179, 0.01:  2.681 },
+    13: { 0.25: 0.694, 0.10: 1.350, 0.05: 1.771, 0.025:  2.160, 0.01:  2.650 },
+    14: { 0.25: 0.692, 0.10: 1.345, 0.05: 1.761, 0.025:  2.145, 0.01:  2.624 },
+    15: { 0.25: 0.691, 0.10: 1.341, 0.05: 1.753, 0.025:  2.131, 0.01:  2.602 },
+    16: { 0.25: 0.690, 0.10: 1.337, 0.05: 1.746, 0.025:  2.120, 0.01:  2.583 },
+    17: { 0.25: 0.689, 0.10: 1.333, 0.05: 1.740, 0.025:  2.110, 0.01:  2.567 },
+    18: { 0.25: 0.688, 0.10: 1.330, 0.05: 1.734, 0.025:  2.101, 0.01:  2.552 },
+    19: { 0.25: 0.688, 0.10: 1.328, 0.05: 1.729, 0.025:  2.093, 0.01:  2.539 },
+    20: { 0.25: 0.687, 0.10: 1.325, 0.05: 1.725, 0.025:  2.086, 0.01:  2.528 },
+    21: { 0.25: 0.686, 0.10: 1.323, 0.05: 1.721, 0.025:  2.080, 0.01:  2.518 },
+    22: { 0.25: 0.686, 0.10: 1.321, 0.05: 1.717, 0.025:  2.074, 0.01:  2.508 },
+    23: { 0.25: 0.685, 0.10: 1.319, 0.05: 1.714, 0.025:  2.069, 0.01:  2.500 },
+    24: { 0.25: 0.685, 0.10: 1.318, 0.05: 1.711, 0.025:  2.064, 0.01:  2.492 },
+    25: { 0.25: 0.684, 0.10: 1.316, 0.05: 1.708, 0.025:  2.060, 0.01:  2.485 },
+    26: { 0.25: 0.684, 0.10: 1.315, 0.05: 1.706, 0.025:  2.056, 0.01:  2.479 },
+    27: { 0.25: 0.684, 0.10: 1.314, 0.05: 1.703, 0.025:  2.052, 0.01:  2.473 },
+    28: { 0.25: 0.683, 0.10: 1.313, 0.05: 1.701, 0.025:  2.048, 0.01:  2.467 },
+    29: { 0.25: 0.683, 0.10: 1.311, 0.05: 1.699, 0.025:  2.045, 0.01:  2.462 },
+    30: { 0.25: 0.683, 0.10: 1.310, 0.05: 1.697, 0.025:  2.042, 0.01:  2.457 },
+    40: { 0.25: 0.681, 0.10: 1.303, 0.05: 1.684, 0.025:  2.021, 0.01:  2.423 },
+    60: { 0.25: 0.679, 0.10: 1.296, 0.05: 1.671, 0.025:  2.000, 0.01:  2.390 },
+    120:{ 0.25: 0.677, 0.10: 1.289, 0.05: 1.658, 0.025:  1.980, 0.01:  2.358 },
+    // ∞ (large df)
+    999:{ 0.25: 0.674, 0.10: 1.282, 0.05: 1.645, 0.025:  1.960, 0.01:  2.326 },
+  };
+
+  const T_TABLE_ALPHAS = [0.25, 0.10, 0.05, 0.025, 0.01];
+  const T_TABLE_DFS = Object.keys(T_TABLE).map(Number);
+
+  /* ── Regularised Incomplete Beta (Lentz continued-fraction fallback) ── */
+  function _betaCf(a, b, x) {
+    const MAXIT = 200, EPS = 3e-14, FPMIN = 1e-300;
+    const qab = a + b, qap = a + 1, qam = a - 1;
+    let c = 1, d = 1 - qab * x / qap;
+    if (Math.abs(d) < FPMIN) d = FPMIN;
+    d = 1 / d;
+    let h = d;
+    for (let m = 1; m <= MAXIT; m++) {
+      const m2 = 2 * m;
+      let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+      d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+      c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+      d = 1 / d; h *= d * c;
+      aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+      d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+      c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+      d = 1 / d;
+      const del = d * c;
+      h *= del;
+      if (Math.abs(del - 1) <= EPS) break;
+    }
+    return h;
+  }
+
+  function _lnGamma(x) {
+    const c = [76.18009172947146,-86.50532032941677,24.01409824083091,
+               -1.231739572450155,0.1208650973866179e-2,-0.5395239384953e-5];
+    let y = x, tmp = x + 5.5;
+    tmp -= (x + 0.5) * Math.log(tmp);
+    let ser = 1.000000000190015;
+    for (let j = 0; j < 6; j++) ser += c[j] / ++y;
+    return -tmp + Math.log(2.5066282746310005 * ser / x);
+  }
+
+  function _ibeta(x, a, b) {
+    if (x <= 0) return 0;
+    if (x >= 1) return 1;
+    const lbeta = _lnGamma(a) + _lnGamma(b) - _lnGamma(a + b);
+    const front = Math.exp(Math.log(x) * a + Math.log(1 - x) * b - lbeta) / a;
+    if (x < (a + 1) / (a + b + 2)) return front * _betaCf(a, b, x);
+    return 1 - Math.exp(Math.log(1 - x) * b + Math.log(x) * a - lbeta) / b * _betaCf(b, a, 1 - x);
+  }
+
+  /* ── t CDF — P(T ≤ t) for T~t(df) ── */
+  function tCdf(t, df) {
+    if (typeof jStat !== 'undefined') return jStat.studentt.cdf(t, df);
+    // Regularised incomplete beta fallback
+    const x = df / (df + t * t);
+    const ibx = _ibeta(x, df / 2, 0.5);
+    return t < 0 ? ibx / 2 : 1 - ibx / 2;
+  }
+
+  /* ── t PPF — inverse CDF (quantile): P(T ≤ t) = p ── */
+  function tPpf(p, df) {
+    if (typeof jStat !== 'undefined') return jStat.studentt.inv(p, df);
+    // Bisection fallback (accurate to ~8 dp)
+    if (p <= 0) return -Infinity;
+    if (p >= 1) return Infinity;
+    if (Math.abs(p - 0.5) < 1e-12) return 0;
+    let lo = -1000, hi = 1000;
+    // Bracket
+    while (tCdf(lo, df) > p) lo *= 2;
+    while (tCdf(hi, df) < p) hi *= 2;
+    for (let i = 0; i < 80; i++) {
+      const mid = (lo + hi) / 2;
+      if (tCdf(mid, df) < p) lo = mid; else hi = mid;
+      if (hi - lo < 1e-10) break;
+    }
+    return (lo + hi) / 2;
+  }
+
+  /* ── Table lookup: find exact row for df ── */
+  function tableRow(df) {
+    if (T_TABLE[df]) return { df, row: T_TABLE[df], exact: true };
+    // No interpolation — reference table only has specific df values
+    return { df, row: null, exact: false };
+  }
+
+  /* ── Validate inputs ── */
+  function validateInputs(opts) {
+    const errors = [];
+    const df = Number(opts.df);
+    if (opts.df == null || opts.df === '' || isNaN(df)) errors.push('Degrees of freedom (df) must be a number');
+    else if (df <= 0) errors.push('Degrees of freedom must be greater than 0');
+
+    if (opts.alpha != null) {
+      const alpha = Number(opts.alpha);
+      if (isNaN(alpha)) errors.push('α (alpha) must be a number');
+      else if (alpha <= 0 || alpha >= 1) errors.push('α must be between 0 and 1 (exclusive)');
+    }
+
+    if (opts.t != null) {
+      const tv = Number(opts.t);
+      if (isNaN(tv)) errors.push('t statistic must be numeric');
+    }
+
+    return errors;
+  }
+
+  /* ── Mode A: Find Critical t ── */
+  function criticalT(opts) {
+    /*
+      opts: { df, alpha, tail: 'left'|'right'|'two-tailed' }
+    */
+    const errors = validateInputs(opts);
+    if (errors.length) return { error: errors.join('; ') };
+
+    const df = Number(opts.df);
+    const alpha = Number(opts.alpha);
+    const tail = opts.tail || 'two-tailed';
+
+    // Determine the one-tailed alpha to use for ppf
+    let tableAlpha, ppfP, critSign;
+    if (tail === 'two-tailed') {
+      tableAlpha = alpha / 2;
+      ppfP = 1 - tableAlpha;          // P(T ≤ t) = 1 - α/2
+    } else if (tail === 'right') {
+      tableAlpha = alpha;
+      ppfP = 1 - alpha;               // P(T ≤ t) = 1 - α
+    } else { // left
+      tableAlpha = alpha;
+      ppfP = alpha;                   // P(T ≤ t) = α  → negative critical value
+    }
+
+    const exactCrit = tPpf(ppfP, df);
+
+    // Table lookup
+    const { row } = tableRow(df);
+    let tableValue = null;
+    let tableAvailable = false;
+    if (row) {
+      // Find nearest supported alpha in table
+      const nearestAlpha = T_TABLE_ALPHAS.reduce((best, a) =>
+        Math.abs(a - tableAlpha) < Math.abs(best - tableAlpha) ? a : best, T_TABLE_ALPHAS[0]);
+      if (Math.abs(nearestAlpha - tableAlpha) < 1e-9) {
+        tableValue = row[tableAlpha];
+        tableAvailable = true;
+      }
+    }
+
+    const criticalValue = tail === 'left' ? -Math.abs(exactCrit) : Math.abs(exactCrit);
+
+    return {
+      distribution: 'student_t',
+      mode: 'critical',
+      df,
+      alpha,
+      tail,
+      tableAlpha,
+      criticalValue: parseFloat(criticalValue.toFixed(6)),
+      criticalValueAbs: parseFloat(Math.abs(exactCrit).toFixed(6)),
+      tableValue: tableAvailable ? tableValue : null,
+      tableAvailable,
+      tableDF: T_TABLE[df] ? true : false,
+      method: tableAvailable ? 'reference-table+exact' : 'exact',
+    };
+  }
+
+  /* ── Mode B: Calculate probability / p-value ── */
+  function probability(opts) {
+    /*
+      opts: { df, t, tail: 'left'|'right'|'two-tailed' }
+    */
+    const errors = validateInputs({ df: opts.df, t: opts.t });
+    if (errors.length) return { error: errors.join('; ') };
+
+    const df = Number(opts.df);
+    const t = Number(opts.t);
+    const tail = opts.tail || 'two-tailed';
+
+    const leftP  = tCdf(t, df);          // P(T ≤ t)
+    const rightP = 1 - leftP;            // P(T ≥ t)
+
+    let prob;
+    if (tail === 'left')         prob = leftP;
+    else if (tail === 'right')   prob = rightP;
+    else /* two-tailed */        prob = 2 * Math.min(leftP, rightP);
+
+    prob = Math.max(0, Math.min(1, prob));
+
+    return {
+      distribution: 'student_t',
+      mode: 'probability',
+      df,
+      t: parseFloat(t.toFixed(6)),
+      tail,
+      probability: parseFloat(prob.toFixed(7)),
+      percentage: parseFloat((prob * 100).toFixed(5)),
+      leftTail:  parseFloat(leftP.toFixed(7)),
+      rightTail: parseFloat(rightP.toFixed(7)),
+      pValue: parseFloat(prob.toFixed(7)),
+    };
+  }
+
+  /* ── Mode C: Test a t statistic ── */
+  function testStatistic(opts) {
+    /*
+      opts: { df, t, alpha, tail }
+    */
+    const errors = validateInputs(opts);
+    if (errors.length) return { error: errors.join('; ') };
+
+    const df = Number(opts.df);
+    const tObs = Number(opts.t);
+    const alpha = Number(opts.alpha);
+    const tail = opts.tail || 'two-tailed';
+
+    const critResult = criticalT({ df, alpha, tail });
+    if (critResult.error) return critResult;
+
+    const probResult = probability({ df, t: tObs, tail });
+    if (probResult.error) return probResult;
+
+    const pValue = probResult.pValue;
+    const tCrit = critResult.criticalValue;
+    const tCritAbs = critResult.criticalValueAbs;
+    const tObsAbs = Math.abs(tObs);
+
+    let reject;
+    if (tail === 'two-tailed') reject = tObsAbs >= tCritAbs;
+    else if (tail === 'right') reject = tObs >= tCritAbs;
+    else                       reject = tObs <= -tCritAbs;
+
+    return {
+      distribution: 'student_t',
+      mode: 'test',
+      df,
+      tObserved: parseFloat(tObs.toFixed(6)),
+      alpha,
+      tail,
+      tableAlpha: critResult.tableAlpha,
+      tCritical: parseFloat(tCrit.toFixed(6)),
+      tCriticalAbs: parseFloat(tCritAbs.toFixed(6)),
+      tableValue: critResult.tableValue,
+      tableAvailable: critResult.tableAvailable,
+      pValue: parseFloat(pValue.toFixed(7)),
+      reject,
+      decision: reject ? 'Reject H₀' : 'Fail to reject H₀',
+    };
+  }
+
+  /* ── Reference comparison: compute exact vs table for all entries ── */
+  function referenceComparison() {
+    const TOLERANCE = 0.005; // table values are rounded to 3 dp
+    const results = [];
+    T_TABLE_DFS.forEach(df => {
+      const row = T_TABLE[df];
+      T_TABLE_ALPHAS.forEach(alpha => {
+        const tableVal = row[alpha];
+        // one-tailed: t = ppf(1 - alpha, df)
+        const exactVal = tPpf(1 - alpha, df);
+        const diff = Math.abs(exactVal - tableVal);
+        results.push({
+          df, alpha, tableValue: tableVal,
+          exactValue: parseFloat(exactVal.toFixed(6)),
+          diff: parseFloat(diff.toFixed(6)),
+          pass: diff <= TOLERANCE,
+        });
+      });
+    });
+    return results;
+  }
+
+  /* ── Golden test runner ── */
+  function runGoldenTests() {
+    const tests = [
+      { name: 'TEST 1: df=1, one-tailed, α=.05', call: () => criticalT({ df:1, alpha:0.05, tail:'right' }), check: r => Math.abs(r.criticalValue - 6.314) < 0.01, expected: 6.314 },
+      { name: 'TEST 2: df=10, one-tailed, α=.05', call: () => criticalT({ df:10, alpha:0.05, tail:'right' }), check: r => Math.abs(r.criticalValue - 1.812) < 0.01, expected: 1.812 },
+      { name: 'TEST 3: df=10, two-tailed, α=.05 (+)', call: () => criticalT({ df:10, alpha:0.05, tail:'two-tailed' }), check: r => Math.abs(r.criticalValue - 2.228) < 0.01, expected: 2.228 },
+      { name: 'TEST 4: df=10, one-tailed, α=.01', call: () => criticalT({ df:10, alpha:0.01, tail:'right' }), check: r => Math.abs(r.criticalValue - 2.764) < 0.01, expected: 2.764 },
+      { name: 'TEST 5: df=10, two-tailed, α=.02 (→ α/2=.01)', call: () => criticalT({ df:10, alpha:0.02, tail:'two-tailed' }), check: r => Math.abs(r.criticalValue - 2.764) < 0.01, expected: 2.764 },
+      { name: 'TEST 6: df=10, t=2.228, two-tailed p≈.05', call: () => probability({ df:10, t:2.228, tail:'two-tailed' }), check: r => Math.abs(r.pValue - 0.05) < 0.005, expected: '~0.05' },
+      { name: 'TEST 7: df=10, t=0, left P(T≤0)=.5', call: () => probability({ df:10, t:0, tail:'left' }), check: r => Math.abs(r.probability - 0.5) < 1e-6, expected: 0.5 },
+      { name: 'TEST 8: df=10, t=-2.228, two-tailed p≈.05', call: () => probability({ df:10, t:-2.228, tail:'two-tailed' }), check: r => Math.abs(r.pValue - 0.05) < 0.005, expected: '~0.05' },
+    ];
+
+    return tests.map(test => {
+      try {
+        const result = test.call();
+        const pass = !result.error && test.check(result);
+        return { name: test.name, pass, result, expected: test.expected };
+      } catch(e) {
+        return { name: test.name, pass: false, error: e.message, expected: test.expected };
+      }
+    });
+  }
+
+  let _lastResult = null;
+  function getLastResult() { return _lastResult; }
+  function setLastResult(r) { _lastResult = r; }
+
+  return {
+    tCdf, tPpf, criticalT, probability, testStatistic,
+    referenceComparison, runGoldenTests, tableRow,
+    T_TABLE, T_TABLE_ALPHAS, T_TABLE_DFS,
+    getLastResult, setLastResult
+  };
+})();
+
+/* ── Student's t Distribution UI ─────────────────────────────────── */
+const StudentTUI = (() => {
+
+  let _activeMode = 'critical'; // 'critical' | 'probability' | 'test'
+
+  /* ── i18n helpers ── */
+  function t(en, id) { return (typeof _appMode !== 'undefined' && typeof I18N !== 'undefined' && I18N.getLang() === 'id') ? id : en; }
+
+  /* ── Modal shell ── */
+  function open() {
+    const existing = document.getElementById('student-t-overlay');
+    if (existing) existing.remove();
+
+    const overlay = el('div', { id: 'student-t-overlay', class: 'dialog-overlay' });
+    const box = el('div', { class: 'dialog-box st-modal-box' });
+
+    box.appendChild(el('div', { class: 'dialog-header' },
+      el('h2', { style: { fontSize: '15px', fontWeight: '700' } }, '📐 ' + t("Student's t Distribution", "Distribusi t Student")),
+      el('button', { class: 'dialog-close', onclick: () => overlay.remove() }, '×')
+    ));
+
+    // Mode tabs
+    const modeTabBar = el('div', { class: 'prob-sub-tabs' });
+    const MODES = [
+      { id: 'critical',    labelEn: 'Find Critical t',       labelId: 'Cari t Kritis' },
+      { id: 'probability', labelEn: 'Probability / p-value', labelId: 'Probabilitas / p-value' },
+      { id: 'test',        labelEn: 'Test t Statistic',      labelId: 'Uji Statistik t' },
+      { id: 'diagnostics', labelEn: '🔬 Diagnostics',        labelId: '🔬 Diagnostik' },
+    ];
+
+    const contentEl = el('div', { class: 'st-modal-content' });
+
+    function switchMode(id) {
+      _activeMode = id;
+      modeTabBar.querySelectorAll('.prob-sub-tab').forEach(b =>
+        b.classList.toggle('active', b.dataset.id === id));
+      contentEl.innerHTML = '';
+      if (id === 'critical')         renderCriticalMode(contentEl);
+      else if (id === 'probability') renderProbabilityMode(contentEl);
+      else if (id === 'test')        renderTestMode(contentEl);
+      else                           renderDiagnosticsMode(contentEl);
+    }
+
+    MODES.forEach(m => {
+      const btn = el('button', {
+        class: `prob-sub-tab${_activeMode === m.id ? ' active' : ''}`,
+        'data-id': m.id,
+        onclick: () => switchMode(m.id)
+      }, t(m.labelEn, m.labelId));
+      modeTabBar.appendChild(btn);
+    });
+
+    box.appendChild(modeTabBar);
+    box.appendChild(contentEl);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    switchMode(_activeMode);
+  }
+
+  /* ════════════════════════════════════════════════════
+     SHARED FORM HELPERS
+  ════════════════════════════════════════════════════ */
+
+  /** Single text input field */
+  function numField(label, key, state, placeholder, hint, onEnter) {
+    const wrap = el('div', { class: 'st-field' });
+    wrap.appendChild(el('label', { class: 'st-label' }, label));
+    const inp = el('input', {
+      type: 'text', class: 'form-control st-input',
+      placeholder, value: state[key] != null ? state[key] : '',
+      oninput: e => { state[key] = e.target.value; },
+    });
+    if (onEnter) inp.addEventListener('keydown', e => { if (e.key === 'Enter') onEnter(); });
+    wrap.appendChild(inp);
+    if (hint) wrap.appendChild(el('div', { class: 'st-hint' }, hint));
+    return { wrap, inp };
+  }
+
+  /**
+   * Alpha selector: preset dropdown + optional custom numeric input.
+   * Shows ONLY the dropdown for preset values.
+   * Shows the custom input ONLY when "Custom" is selected.
+   */
+  function alphaField(state, key, onEnter) {
+    const wrap = el('div', { class: 'st-field' });
+    wrap.appendChild(el('label', { class: 'st-label' }, t('Significance level (α)', 'Tingkat signifikansi (α)')));
+
+    const PRESETS = ['0.25', '0.10', '0.05', '0.025', '0.01'];
+    const isPreset = v => PRESETS.includes(String(v));
+
+    const sel = el('select', { class: 'form-control st-input' });
+    PRESETS.forEach(v => sel.appendChild(el('option', { value: v }, v)));
+    sel.appendChild(el('option', { value: '__custom__' }, t('Custom…', 'Lainnya…')));
+
+    const customWrap = el('div', { class: 'st-custom-alpha', style: { display: 'none', marginTop: '6px' } });
+    const customInp = el('input', {
+      type: 'text', class: 'form-control st-input',
+      placeholder: t('e.g. 0.0375', 'mis. 0.0375'),
+      value: (!isPreset(state[key]) && state[key]) ? state[key] : '',
+    });
+    customWrap.appendChild(customInp);
+    customWrap.appendChild(el('div', { class: 'st-hint' }, t('Any value between 0 and 1', 'Nilai antara 0 dan 1')));
+    if (onEnter) customInp.addEventListener('keydown', e => { if (e.key === 'Enter') onEnter(); });
+
+    // Set initial select value
+    const initVal = String(state[key] || '0.05');
+    if (isPreset(initVal)) {
+      sel.value = initVal;
+    } else {
+      sel.value = '__custom__';
+      customWrap.style.display = '';
+    }
+
+    sel.addEventListener('change', () => {
+      if (sel.value === '__custom__') {
+        customWrap.style.display = '';
+        customInp.value = state[key] && !isPreset(state[key]) ? state[key] : '';
+        customInp.focus();
+      } else {
+        customWrap.style.display = 'none';
+        state[key] = sel.value;
+      }
+    });
+    customInp.addEventListener('input', () => { state[key] = customInp.value; });
+
+    wrap.appendChild(sel);
+    wrap.appendChild(customWrap);
+    wrap.appendChild(el('div', { class: 'st-hint' }, t(
+      'Table values: 0.25 / 0.10 / 0.05 / 0.025 / 0.01',
+      'Nilai tabel: 0.25 / 0.10 / 0.05 / 0.025 / 0.01'
+    )));
+    return wrap;
+  }
+
+  /** Segmented tail selector — one active at a time, accent color */
+  function tailField(state, key, onChange) {
+    const wrap = el('div', { class: 'st-field' });
+    wrap.appendChild(el('label', { class: 'st-label' }, t('Tail', 'Ekor')));
+    const seg = el('div', { class: 'st-seg-group' });
+    const OPTIONS = [
+      { val: 'left',       en: '◀ Left',        id: '◀ Kiri' },
+      { val: 'right',      en: 'Right ▶',       id: 'Kanan ▶' },
+      { val: 'two-tailed', en: '↔ Two-tailed',  id: '↔ Dua Sisi' },
+    ];
+    const btns = OPTIONS.map(opt => {
+      const btn = el('button', {
+        class: 'st-seg-btn' + (state[key] === opt.val ? ' active' : ''),
+        type: 'button',
+        onclick: () => {
+          state[key] = opt.val;
+          btns.forEach((b, i) => b.classList.toggle('active', OPTIONS[i].val === opt.val));
+          if (onChange) onChange(opt.val);
+        }
+      }, t(opt.en, opt.id));
+      seg.appendChild(btn);
+      return btn;
+    });
+    wrap.appendChild(seg);
+    return wrap;
+  }
+
+  /** Compact help sidebar panel */
+  function helpPanel(items) {
+    const panel = el('div', { class: 'st-help-panel' });
+    items.forEach(({ title, body }) => {
+      panel.appendChild(el('div', { class: 'st-help-item' },
+        el('div', { class: 'st-help-title' }, title),
+        el('div', { class: 'st-help-body' }, body)
+      ));
+    });
+    return panel;
+  }
+
+  /* ════════════════════════════════════════════════════
+     GRAPH (enlarged SVG, full labels)
+  ════════════════════════════════════════════════════ */
+
+  function renderTCurve(container, opts, chartId) {
+    const { df, alpha, tail, criticalValueAbs, tValue, mode, label } = opts;
+    const dfSafe = Math.max(1, Number(df) || 1);
+    // Dynamic x-range: for small df the tails are very heavy; for df≥30 ±4 is enough
+    const xMax = Math.max(4, Math.min(8, (criticalValueAbs || Math.abs(tValue) || 2) * 1.35));
+    const tRange = [-xMax, xMax];
+
+    const W = 560, H = 320;
+    const pad = { l: 48, r: 48, t: 64, b: 48 };
+    const gW = W - pad.l - pad.r, gH = H - pad.t - pad.b;
+
+    /* lgamma via Lanczos — same coefficients as in the engine */
+    function lgamma(x) {
+      if (x < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * x)) - lgamma(1 - x);
+      x -= 1;
+      const c = [0.99999999999980993,676.5203681218851,-1259.1392167224028,
+        771.32342877765313,-176.61502916214059,12.507343278686905,
+        -0.13857109526572012,9.9843695780195716e-6,1.5056327351493116e-7];
+      let s = c[0];
+      for (let i = 1; i < 9; i++) s += c[i] / (x + i);
+      const tt = x + 7.5;
+      return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(tt) - tt + Math.log(s);
+    }
+    function tPdf(tv, df) {
+      const a = (df + 1) / 2, b = df / 2;
+      const lnC = lgamma(a) - 0.5 * Math.log(df * Math.PI) - lgamma(b);
+      return Math.exp(lnC - a * Math.log(1 + tv * tv / df));
+    }
+
+    const pdfMax = tPdf(0, dfSafe);
+    function xToSvg(tv) { return pad.l + (tv - tRange[0]) / (tRange[1] - tRange[0]) * gW; }
+    function yToSvg(p)  { return pad.t + gH - (p / pdfMax) * gH * 0.9; }
+
+    const STEPS = 300;
+    const pts = [];
+    for (let i = 0; i <= STEPS; i++) {
+      const tv = tRange[0] + (tRange[1] - tRange[0]) * i / STEPS;
+      pts.push([xToSvg(tv), yToSvg(tPdf(tv, dfSafe))]);
+    }
+    const curvePath = 'M' + pts.map(p => p.join(',')).join('L');
+    const baselineY = pad.t + gH;
+
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    if (chartId) svg.id = chartId;
+    svg.setAttribute('width', W); svg.setAttribute('height', H);
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.setAttribute('class', 'st-chart-svg');
+    svg.setAttribute('data-df', dfSafe);
+    // white background for export
+    const bg = document.createElementNS(ns, 'rect');
+    bg.setAttribute('width', W); bg.setAttribute('height', H);
+    bg.setAttribute('fill', '#ffffff');
+    svg.appendChild(bg);
+
+    /* shade helper */
+    function shade(from, to, color) {
+      const zF = Math.max(tRange[0], from), zT = Math.min(tRange[1], to);
+      if (zF >= zT) return;
+      const p2 = [];
+      for (let i = 0; i <= 120; i++) {
+        const tv = zF + (zT - zF) * i / 120;
+        p2.push([xToSvg(tv), yToSvg(tPdf(tv, dfSafe))]);
+      }
+      const d = `M${xToSvg(zF)},${baselineY} L${p2.map(p=>p.join(',')).join('L')} L${xToSvg(zT)},${baselineY} Z`;
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', d); path.setAttribute('fill', color); path.setAttribute('opacity', '0.38');
+      svg.appendChild(path);
+    }
+
+    /* acceptance region highlight */
+    const critAbs = criticalValueAbs != null ? criticalValueAbs : (tValue != null ? Math.abs(tValue) : 2);
+    if (tail === 'two-tailed') {
+      shade(-critAbs, critAbs, '#dcfce7');   // acceptance (green tint)
+      shade(tRange[0], -critAbs, '#7c5cd8'); // left rejection
+      shade(critAbs, tRange[1], '#7c5cd8');  // right rejection
+    } else if (tail === 'right') {
+      shade(tRange[0], critAbs, '#dcfce7');
+      shade(critAbs, tRange[1], '#e6871e');
+    } else {
+      shade(-critAbs, tRange[1], '#dcfce7');
+      shade(tRange[0], -critAbs, '#3b82d4');
+    }
+
+    /* observed t line (test mode) */
+    if (mode === 'test' && tValue != null) {
+      const xObs = xToSvg(tValue);
+      const ln = document.createElementNS(ns, 'line');
+      ln.setAttribute('x1', xObs); ln.setAttribute('y1', pad.t);
+      ln.setAttribute('x2', xObs); ln.setAttribute('y2', baselineY);
+      ln.setAttribute('stroke', '#dc2626'); ln.setAttribute('stroke-width', '2.5');
+      svg.appendChild(ln);
+      const lbl = document.createElementNS(ns, 'text');
+      lbl.setAttribute('x', xObs + 4); lbl.setAttribute('y', pad.t + 12);
+      lbl.setAttribute('font-size', '10'); lbl.setAttribute('fill', '#dc2626');
+      lbl.textContent = `t=${Number(tValue).toFixed(3)}`;
+      svg.appendChild(lbl);
+    }
+
+    /* curve */
+    const curveEl = document.createElementNS(ns, 'path');
+    curveEl.setAttribute('d', curvePath); curveEl.setAttribute('fill', 'none');
+    curveEl.setAttribute('stroke', '#1f2328'); curveEl.setAttribute('stroke-width', '2.2');
+    svg.appendChild(curveEl);
+
+    /* baseline */
+    const bl = document.createElementNS(ns, 'line');
+    bl.setAttribute('x1', pad.l); bl.setAttribute('y1', baselineY);
+    bl.setAttribute('x2', W - pad.r); bl.setAttribute('y2', baselineY);
+    bl.setAttribute('stroke', '#6b7280'); bl.setAttribute('stroke-width', '1');
+    svg.appendChild(bl);
+
+    /* axis tick helpers */
+    function xTick(tv, lbl, color) {
+      const xp = xToSvg(tv);
+      if (xp < pad.l - 4 || xp > W - pad.r + 4) return;
+      const tk = document.createElementNS(ns, 'line');
+      tk.setAttribute('x1', xp); tk.setAttribute('y1', baselineY);
+      tk.setAttribute('x2', xp); tk.setAttribute('y2', baselineY + 5);
+      tk.setAttribute('stroke', color || '#6b7280'); tk.setAttribute('stroke-width', '1');
+      svg.appendChild(tk);
+      const tx = document.createElementNS(ns, 'text');
+      tx.setAttribute('x', xp); tx.setAttribute('y', baselineY + 16);
+      tx.setAttribute('text-anchor', 'middle'); tx.setAttribute('font-size', '11');
+      tx.setAttribute('fill', color || '#374151'); tx.textContent = lbl;
+      svg.appendChild(tx);
+    }
+
+    /* standard axis ticks */
+    [-3, -2, -1, 0, 1, 2, 3].forEach(v => {
+      if (Math.abs(v) <= xMax) xTick(v, String(v), '#9ca3af');
+    });
+
+    /* critical value dashed markers */
+    function critMarker(tv, color, lbl) {
+      const xp = xToSvg(tv);
+      if (xp < pad.l - 4 || xp > W - pad.r + 4) return;
+      const ln = document.createElementNS(ns, 'line');
+      ln.setAttribute('x1', xp); ln.setAttribute('y1', pad.t);
+      ln.setAttribute('x2', xp); ln.setAttribute('y2', baselineY);
+      ln.setAttribute('stroke', color); ln.setAttribute('stroke-width', '1.8');
+      ln.setAttribute('stroke-dasharray', '5,3');
+      svg.appendChild(ln);
+      // label above baseline
+      const tx = document.createElementNS(ns, 'text');
+      tx.setAttribute('x', xp); tx.setAttribute('y', baselineY + 30);
+      tx.setAttribute('text-anchor', 'middle'); tx.setAttribute('font-size', '11');
+      tx.setAttribute('font-weight', '700'); tx.setAttribute('fill', color);
+      tx.textContent = lbl;
+      svg.appendChild(tx);
+    }
+
+    const critDisplay = critAbs.toFixed(3);
+    if (tail === 'two-tailed') {
+      critMarker(-critAbs, '#7c5cd8', `−${critDisplay}`);
+      critMarker( critAbs, '#7c5cd8', `+${critDisplay}`);
+    } else if (tail === 'right') {
+      critMarker(critAbs, '#e6871e', `+${critDisplay}`);
+    } else {
+      critMarker(-critAbs, '#3b82d4', `−${critDisplay}`);
+    }
+
+    /* chart title block (top) */
+    const titleLine1 = document.createElementNS(ns, 'text');
+    titleLine1.setAttribute('x', W / 2); titleLine1.setAttribute('y', 18);
+    titleLine1.setAttribute('text-anchor', 'middle'); titleLine1.setAttribute('font-size', '13');
+    titleLine1.setAttribute('font-weight', '700'); titleLine1.setAttribute('fill', '#1f2328');
+    titleLine1.textContent = t("Student's t Distribution", "Distribusi t Student");
+    svg.appendChild(titleLine1);
+
+    const metaStr = `df = ${dfSafe}   α = ${alpha != null ? alpha : '—'}   ${
+      tail === 'two-tailed' ? t('Two-tailed', 'Dua Sisi') :
+      tail === 'right'      ? t('Right-tailed', 'Ekor Kanan') :
+                              t('Left-tailed', 'Ekor Kiri')}`;
+    const titleLine2 = document.createElementNS(ns, 'text');
+    titleLine2.setAttribute('x', W / 2); titleLine2.setAttribute('y', 36);
+    titleLine2.setAttribute('text-anchor', 'middle'); titleLine2.setAttribute('font-size', '11');
+    titleLine2.setAttribute('fill', '#6b7280');
+    titleLine2.textContent = metaStr;
+    svg.appendChild(titleLine2);
+
+    /* legend */
+    function legendDot(cx, cy, color, lbl) {
+      const r = document.createElementNS(ns, 'rect');
+      r.setAttribute('x', cx); r.setAttribute('y', cy - 7); r.setAttribute('width', 12); r.setAttribute('height', 8);
+      r.setAttribute('fill', color); r.setAttribute('opacity', '0.45');
+      svg.appendChild(r);
+      const tx = document.createElementNS(ns, 'text');
+      tx.setAttribute('x', cx + 15); tx.setAttribute('y', cy);
+      tx.setAttribute('font-size', '10'); tx.setAttribute('fill', '#374151');
+      tx.textContent = lbl;
+      svg.appendChild(tx);
+    }
+    const rejColor = tail === 'two-tailed' ? '#7c5cd8' : tail === 'right' ? '#e6871e' : '#3b82d4';
+    legendDot(pad.l, H - 8, rejColor, t('Rejection region', 'Daerah penolakan'));
+    legendDot(pad.l + 130, H - 8, '#22c55e', t('Acceptance region', 'Daerah penerimaan'));
+
+    container.appendChild(svg);
+    return svg;
+  }
+
+  /* ════════════════════════════════════════════════════
+     CHART EXPORT TOOLBAR (SVG-based chart only)
+  ════════════════════════════════════════════════════ */
+
+  function chartToolbar(svgEl, meta) {
+    const bar = el('div', { class: 'st-chart-toolbar' });
+
+    function downloadSVG() {
+      try {
+        const serial = new XMLSerializer().serializeToString(svgEl);
+        const blob = new Blob([serial], { type: 'image/svg+xml' });
+        const url = URL.createObjectURL(blob);
+        const a = el('a', { href: url, download: `sociostat_student_t_${Date.now()}.svg` });
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      } catch(e) { notify('SVG export failed: ' + e.message, 'error'); }
+    }
+
+    function downloadPNG() {
+      try {
+        const serial = new XMLSerializer().serializeToString(svgEl);
+        const img = new Image();
+        const DPR = 2;
+        const W = parseInt(svgEl.getAttribute('width')) * DPR;
+        const H = parseInt(svgEl.getAttribute('height')) * DPR;
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = W; canvas.height = H;
+          const ctx = canvas.getContext('2d');
+          ctx.scale(DPR, DPR);
+          ctx.drawImage(img, 0, 0);
+          canvas.toBlob(blob => {
+            const url = URL.createObjectURL(blob);
+            const a = el('a', { href: url, download: `sociostat_student_t_${Date.now()}.png` });
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          }, 'image/png');
+        };
+        img.onerror = () => notify('PNG export failed — SVG could not be rasterised.', 'error');
+        const blob = new Blob([serial], { type: 'image/svg+xml' });
+        img.src = URL.createObjectURL(blob);
+      } catch(e) { notify('PNG export failed: ' + e.message, 'error'); }
+    }
+
+    function downloadPDF() {
+      if (typeof jspdf === 'undefined' && typeof window.jspdf === 'undefined' && typeof jsPDF === 'undefined') {
+        notify(t('PDF export unavailable — jsPDF library not loaded. PNG is available.', 'PDF tidak tersedia. Gunakan PNG.'), 'warning', 4000);
+        return;
+      }
+      try {
+        const serial = new XMLSerializer().serializeToString(svgEl);
+        const img = new Image();
+        const W = parseInt(svgEl.getAttribute('width'));
+        const H = parseInt(svgEl.getAttribute('height'));
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = W * 2; canvas.height = H * 2;
+          const ctx = canvas.getContext('2d'); ctx.scale(2,2); ctx.drawImage(img, 0, 0);
+          const imgData = canvas.toDataURL('image/png');
+          const JsPDF = window.jspdf?.jsPDF || window.jsPDF;
+          const doc = new JsPDF({ orientation: W > H ? 'landscape' : 'portrait', unit: 'pt', format: [W + 80, H + 120] });
+          doc.setFontSize(14); doc.setFont('helvetica', 'bold');
+          doc.text("SOCIOSTAT — Student's t Distribution", (W + 80) / 2, 30, { align: 'center' });
+          if (meta) {
+            doc.setFontSize(10); doc.setFont('helvetica', 'normal');
+            const metaLine = `df = ${meta.df}   α = ${meta.alpha}   ${meta.tail}`;
+            doc.text(metaLine, (W + 80) / 2, 46, { align: 'center' });
+          }
+          doc.addImage(imgData, 'PNG', 40, 60, W, H);
+          doc.save(`sociostat_student_t_${Date.now()}.pdf`);
+        };
+        const blob = new Blob([serial], { type: 'image/svg+xml' });
+        img.src = URL.createObjectURL(blob);
+      } catch(e) { notify('PDF export failed: ' + e.message, 'error'); }
+    }
+
+    function addToOutputChart(r) {
+      if (!r) { notify('No result to add.', 'warning'); return; }
+      exportToOutput(r);
+    }
+
+    bar.appendChild(el('span', { class: 'st-chart-toolbar-label' }, t('Download:', 'Unduh:')));
+    bar.appendChild(el('button', { class: 'btn btn-xs st-toolbar-btn', onclick: downloadPNG },
+      t('PNG', 'PNG')));
+    bar.appendChild(el('button', { class: 'btn btn-xs st-toolbar-btn', onclick: downloadSVG },
+      t('SVG', 'SVG')));
+    bar.appendChild(el('button', { class: 'btn btn-xs st-toolbar-btn', onclick: downloadPDF },
+      t('PDF', 'PDF')));
+    return { bar, downloadPNG, downloadSVG, downloadPDF };
+  }
+
+  /* ════════════════════════════════════════════════════
+     MODE A: FIND CRITICAL t
+  ════════════════════════════════════════════════════ */
+
+  function renderCriticalMode(container) {
+    const state = { df: '', alpha: '0.05', tail: 'two-tailed' };
+
+    /* two-column layout */
+    const layout = el('div', { class: 'st-layout' });
+    const leftCol  = el('div', { class: 'st-col-left' });
+    const rightCol = el('div', { class: 'st-col-right' });
+
+    function doCalc() {
+      graphArea.innerHTML = '';
+      resultArea.innerHTML = '';
+      const r = StudentTCalc.criticalT({ df: state.df, alpha: state.alpha, tail: state.tail });
+      StudentTCalc.setLastResult(r);
+      if (r.error) {
+        resultArea.appendChild(stError(r.error,
+          t('df must be a positive number; α must be between 0 and 1.',
+            'df harus bilangan positif; α harus antara 0 dan 1.')));
+        return;
+      }
+      const cid = 'st-chart-' + Date.now();
+      const svgEl = renderTCurve(graphArea,
+        { df: r.df, alpha: r.alpha, tail: r.tail,
+          criticalValueAbs: r.criticalValueAbs, mode: 'critical' }, cid);
+      const { bar } = chartToolbar(svgEl, { df: r.df, alpha: r.alpha, tail: r.tail });
+      graphArea.appendChild(bar);
+      renderCriticalResult(resultArea, r);
+    }
+
+    const { wrap: dfWrap, inp: dfInp } = numField(
+      t('Degrees of freedom (df)', 'Derajat kebebasan (df)'),
+      'df', state, t('e.g. 10', 'mis. 10'),
+      t('Must be > 0 (usually n − 1)', 'Harus > 0 (biasanya n − 1)'),
+      doCalc
+    );
+    leftCol.appendChild(dfWrap);
+    leftCol.appendChild(alphaField(state, 'alpha', doCalc));
+    leftCol.appendChild(tailField(state, 'tail'));
+
+    const calcBtn = el('button', {
+      class: 'btn btn-primary st-calc-btn',
+      onclick: doCalc
+    }, t('⚡ Calculate Critical t', '⚡ Hitung t Kritis'));
+    leftCol.appendChild(calcBtn);
+
+    rightCol.appendChild(helpPanel([
+      { title: t('Why df?', 'Mengapa df?'),
+        body: t('df controls the shape. Larger df → narrower tails → smaller critical values.',
+                'df mengontrol bentuk distribusi. df besar → ekor lebih sempit → nilai kritis lebih kecil.') },
+      { title: t('Two-tailed α', 'α Dua Sisi'),
+        body: t('For two-tailed tests, α is split equally: table α = α / 2.',
+                'Untuk uji dua sisi, α dibagi dua: α tabel = α / 2.') },
+      { title: t('Preset values', 'Nilai preset'),
+        body: t('Common: 0.05 (5%), 0.01 (1%), 0.10 (10%). Use Custom for others.',
+                'Umum: 0.05 (5%), 0.01 (1%), 0.10 (10%). Gunakan Lainnya untuk nilai lain.') },
+    ]));
+
+    layout.appendChild(leftCol);
+    layout.appendChild(rightCol);
+    container.appendChild(layout);
+
+    const graphArea  = el('div', { class: 'st-graph-area' });
+    const resultArea = el('div', { class: 'st-result-area' });
+    container.appendChild(el('div', { class: 'st-section-title' }, t('Distribution', 'Distribusi')));
+    container.appendChild(graphArea);
+    container.appendChild(resultArea);
+  }
+
+  function renderCriticalResult(container, r) {
+    /* ── KEY RESULT ── */
+    const dispVal = r.tail === 'two-tailed'
+      ? `±${r.criticalValueAbs.toFixed(6)}`
+      : r.criticalValue.toFixed(6);
+
+    const keyCard = el('div', { class: 'st-result-key' });
+    keyCard.appendChild(el('div', { class: 'st-result-section-title' }, t('KEY RESULT', 'HASIL UTAMA')));
+    stRow(keyCard, t('t critical', 't kritis'), el('span', { class: 'st-val-hero' }, dispVal));
+    stRow(keyCard, 'df', r.df);
+    stRow(keyCard, 'α', r.alpha);
+    stRow(keyCard, t('Tail', 'Ekor'), r.tail);
+    container.appendChild(keyCard);
+
+    /* ── REFERENCE VALIDATION (collapsible) ── */
+    container.appendChild(refValidation(r));
+
+    /* ── INTERPRETATION ── */
+    container.appendChild(interpretationBlock(r));
+
+    /* ── EXPORT + SYNTAX ── */
+    const actRow = el('div', { class: 'st-action-row' });
+    actRow.appendChild(el('button', {
+      class: 'btn btn-sm', onclick: () => exportToOutput(r)
+    }, '📋 ' + t('Add to Output', 'Tambahkan ke Output')));
+    container.appendChild(actRow);
+    renderSyntax(container, r);
+  }
+
+  /* ════════════════════════════════════════════════════
+     MODE B: PROBABILITY / P-VALUE
+  ════════════════════════════════════════════════════ */
+
+  function renderProbabilityMode(container) {
+    const state = { df: '', t: '', tail: 'two-tailed' };
+
+    const layout = el('div', { class: 'st-layout' });
+    const leftCol  = el('div', { class: 'st-col-left' });
+    const rightCol = el('div', { class: 'st-col-right' });
+
+    function doCalc() {
+      graphArea.innerHTML = '';
+      resultArea.innerHTML = '';
+      const r = StudentTCalc.probability({ df: state.df, t: state.t, tail: state.tail });
+      StudentTCalc.setLastResult(r);
+      if (r.error) {
+        resultArea.appendChild(stError(r.error,
+          t('df must be positive; t must be numeric.',
+            'df harus positif; t harus numerik.')));
+        return;
+      }
+      const cid = 'st-chart-' + Date.now();
+      const svgEl = renderTCurve(graphArea,
+        { df: r.df, tail: r.tail, tValue: r.t,
+          criticalValueAbs: Math.abs(r.t), mode: 'probability' }, cid);
+      const { bar } = chartToolbar(svgEl, { df: r.df, alpha: null, tail: r.tail });
+      graphArea.appendChild(bar);
+      renderProbabilityResult(resultArea, r);
+    }
+
+    const { wrap: dfWrap, inp: dfInp } = numField(
+      t('Degrees of freedom (df)', 'Derajat kebebasan (df)'),
+      'df', state, 'e.g. 10', t('Must be > 0', 'Harus > 0'), doCalc
+    );
+    const { wrap: tWrap, inp: tInp } = numField(
+      t('t statistic', 'Statistik t'),
+      't', state, 'e.g. 2.228', t('Any real number', 'Bilangan real'), doCalc
+    );
+    leftCol.appendChild(dfWrap);
+    leftCol.appendChild(tWrap);
+    leftCol.appendChild(tailField(state, 'tail'));
+    leftCol.appendChild(el('button', {
+      class: 'btn btn-primary st-calc-btn', onclick: doCalc
+    }, t('⚡ Calculate Probability', '⚡ Hitung Probabilitas')));
+
+    rightCol.appendChild(helpPanel([
+      { title: t('Left-tailed', 'Ekor Kiri'), body: 'P(T ≤ t)' },
+      { title: t('Right-tailed', 'Ekor Kanan'), body: 'P(T ≥ t)' },
+      { title: t('Two-tailed', 'Dua Sisi'),
+        body: t('2 × min(P(T ≤ t), P(T ≥ t))', '2 × min(P(T ≤ t), P(T ≥ t))') },
+      { title: t('p-value', 'p-value'),
+        body: t('Probability of observing a result as extreme as t, assuming H₀ is true.',
+                'Probabilitas mendapat nilai t seekstrem ini, jika H₀ benar.') },
+    ]));
+
+    layout.appendChild(leftCol);
+    layout.appendChild(rightCol);
+    container.appendChild(layout);
+
+    const graphArea  = el('div', { class: 'st-graph-area' });
+    const resultArea = el('div', { class: 'st-result-area' });
+    container.appendChild(el('div', { class: 'st-section-title' }, t('Distribution', 'Distribusi')));
+    container.appendChild(graphArea);
+    container.appendChild(resultArea);
+  }
+
+  function renderProbabilityResult(container, r) {
+    const tailLabel = {
+      left:         `P(T ≤ ${r.t.toFixed(4)})`,
+      right:        `P(T ≥ ${r.t.toFixed(4)})`,
+      'two-tailed': t('Two-tailed p-value', 'p-value dua sisi'),
+    }[r.tail];
+
+    const keyCard = el('div', { class: 'st-result-key' });
+    keyCard.appendChild(el('div', { class: 'st-result-section-title' }, t('KEY RESULT', 'HASIL UTAMA')));
+    stRow(keyCard, 't', r.t.toFixed(6));
+    stRow(keyCard, 'df', r.df);
+    stRow(keyCard, tailLabel, el('span', { class: 'st-val-hero' }, r.probability.toFixed(7)));
+    stRow(keyCard, 'p-value', el('span', { class: r.pValue < 0.05 ? 'prob-sig' : 'prob-ns' }, r.pValue.toFixed(7)));
+    container.appendChild(keyCard);
+
+    const detCard = el('div', { class: 'st-result-detail' });
+    stRow(detCard, 'P(T ≤ t) ' + t('left tail', 'ekor kiri'), r.leftTail.toFixed(7));
+    stRow(detCard, 'P(T ≥ t) ' + t('right tail', 'ekor kanan'), r.rightTail.toFixed(7));
+    const sig = r.pValue < 0.001 ? '*** p < .001' : r.pValue < 0.01 ? '** p < .01' : r.pValue < 0.05 ? '* p < .05' : t('Not significant (p ≥ .05)', 'Tidak signifikan (p ≥ .05)');
+    detCard.appendChild(el('div', { class: 'st-interp' }, el('span', { class: r.pValue < 0.05 ? 'prob-sig' : 'prob-ns' }, sig)));
+    container.appendChild(detCard);
+
+    const actRow = el('div', { class: 'st-action-row' });
+    actRow.appendChild(el('button', { class: 'btn btn-sm', onclick: () => exportToOutput(r) },
+      '📋 ' + t('Add to Output', 'Tambahkan ke Output')));
+    container.appendChild(actRow);
+    renderSyntax(container, r);
+  }
+
+  /* ════════════════════════════════════════════════════
+     MODE C: TEST t STATISTIC
+  ════════════════════════════════════════════════════ */
+
+  function renderTestMode(container) {
+    const state = { df: '', t: '', alpha: '0.05', tail: 'two-tailed' };
+
+    const layout = el('div', { class: 'st-layout' });
+    const leftCol  = el('div', { class: 'st-col-left' });
+    const rightCol = el('div', { class: 'st-col-right' });
+
+    function doCalc() {
+      graphArea.innerHTML = '';
+      resultArea.innerHTML = '';
+      const r = StudentTCalc.testStatistic({ df: state.df, t: state.t, alpha: state.alpha, tail: state.tail });
+      StudentTCalc.setLastResult(r);
+      if (r.error) {
+        resultArea.appendChild(stError(r.error,
+          t('df must be positive; t must be numeric; α must be between 0 and 1.',
+            'df harus positif; t harus numerik; α harus antara 0 dan 1.')));
+        return;
+      }
+      const cid = 'st-chart-' + Date.now();
+      const svgEl = renderTCurve(graphArea,
+        { df: r.df, alpha: r.alpha, tail: r.tail,
+          criticalValueAbs: r.tCriticalAbs, tValue: r.tObserved, mode: 'test' }, cid);
+      const { bar } = chartToolbar(svgEl, { df: r.df, alpha: r.alpha, tail: r.tail });
+      graphArea.appendChild(bar);
+      renderTestResult(resultArea, r);
+    }
+
+    const { wrap: tWrap }  = numField(t('Observed t', 't Observasi'), 't',  state, 'e.g. 2.4',  t('Any real number', 'Bilangan real'), doCalc);
+    const { wrap: dfWrap } = numField(t('Degrees of freedom (df)', 'Derajat kebebasan (df)'), 'df', state, 'e.g. 20', t('Must be > 0', 'Harus > 0'), doCalc);
+    leftCol.appendChild(tWrap);
+    leftCol.appendChild(dfWrap);
+    leftCol.appendChild(alphaField(state, 'alpha', doCalc));
+    leftCol.appendChild(tailField(state, 'tail'));
+    leftCol.appendChild(el('button', {
+      class: 'btn btn-primary st-calc-btn', onclick: doCalc
+    }, t('⚡ Run Test', '⚡ Jalankan Uji')));
+
+    rightCol.appendChild(helpPanel([
+      { title: t('Decision rule', 'Aturan keputusan'),
+        body: t('Reject H₀ if |t obs| ≥ t critical (two-tailed) or t obs ≥ t crit (right) or t obs ≤ −t crit (left).',
+                'Tolak H₀ jika |t obs| ≥ t kritis (dua sisi).') },
+      { title: t('Fail to reject ≠ Accept', '"Gagal tolak" ≠ "Terima"'),
+        body: t('"Fail to reject H₀" does not mean H₀ is true — only that evidence is insufficient.',
+                '"Gagal menolak H₀" bukan berarti H₀ benar — hanya kurang bukti.') },
+    ]));
+
+    layout.appendChild(leftCol);
+    layout.appendChild(rightCol);
+    container.appendChild(layout);
+
+    const graphArea  = el('div', { class: 'st-graph-area' });
+    const resultArea = el('div', { class: 'st-result-area' });
+    container.appendChild(el('div', { class: 'st-section-title' }, t('Distribution', 'Distribusi')));
+    container.appendChild(graphArea);
+    container.appendChild(resultArea);
+  }
+
+  function renderTestResult(container, r) {
+    const decisionOk = !r.reject;
+    const keyCard = el('div', { class: 'st-result-key' });
+    keyCard.appendChild(el('div', { class: 'st-result-section-title' }, t('KEY RESULT', 'HASIL UTAMA')));
+    stRow(keyCard, t('Observed t', 't Observasi'), r.tObserved.toFixed(6));
+    stRow(keyCard, 'df', r.df);
+    stRow(keyCard, 'α', r.alpha);
+    stRow(keyCard, t('Tail', 'Ekor'), r.tail);
+    stRow(keyCard, t('t critical', 't kritis'),
+      r.tail === 'two-tailed' ? `±${r.tCriticalAbs.toFixed(6)}` : r.tCritical.toFixed(6));
+    stRow(keyCard, 'p-value', el('span', { class: r.pValue < r.alpha ? 'prob-sig' : 'prob-ns' }, r.pValue.toFixed(7)));
+    keyCard.appendChild(el('div', { class: 'prob-result-divider' }));
+    keyCard.appendChild(el('div', {
+      class: 'st-decision',
+      style: { color: r.reject ? '#dc2626' : '#15803d' }
+    }, (r.reject ? '✗ ' : '✓ ') + r.decision));
+    const detail = r.reject
+      ? `|t| = ${Math.abs(r.tObserved).toFixed(4)} ≥ ${r.tCriticalAbs.toFixed(4)}`
+      : `|t| = ${Math.abs(r.tObserved).toFixed(4)} < ${r.tCriticalAbs.toFixed(4)}`;
+    keyCard.appendChild(el('div', { class: 'st-decision-detail' }, detail));
+    container.appendChild(keyCard);
+
+    if (r.tableAvailable) container.appendChild(refValidation(r));
+    container.appendChild(interpretationBlock(r));
+
+    const actRow = el('div', { class: 'st-action-row' });
+    actRow.appendChild(el('button', { class: 'btn btn-sm', onclick: () => exportToOutput(r) },
+      '📋 ' + t('Add to Output', 'Tambahkan ke Output')));
+    container.appendChild(actRow);
+    renderSyntax(container, r);
+  }
+
+  /* ════════════════════════════════════════════════════
+     SHARED RESULT COMPONENTS
+  ════════════════════════════════════════════════════ */
+
+  /** A two-column label / value row */
+  function stRow(parent, label, value) {
+    const row = el('div', { class: 'prob-result-row' },
+      el('span', { class: 'prob-result-label' }, label)
+    );
+    if (value instanceof Node) row.appendChild(value);
+    else row.appendChild(el('span', { class: 'prob-result-value' }, String(value)));
+    parent.appendChild(row);
+  }
+
+  /** Error box with what/why/how */
+  function stError(msg, hint) {
+    return el('div', { class: 'prob-error' },
+      el('strong', {}, '⚠ ' + t('What happened?', 'Apa yang terjadi?')), el('br', {}),
+      msg, el('br', {}),
+      el('span', { class: 'st-hint' }, hint)
+    );
+  }
+
+  /** Collapsible reference validation section */
+  function refValidation(r) {
+    const wrap = el('div', { class: 'st-collapsible' });
+    let open = false;
+    const header = el('div', { class: 'st-collapsible-header', onclick: () => {
+      open = !open;
+      body.style.display = open ? '' : 'none';
+      toggle.textContent = open ? '▴' : '▾';
+    }});
+    const toggle = el('span', { class: 'st-collapsible-toggle' }, '▾');
+    header.appendChild(toggle);
+    header.appendChild(el('span', {}, t('▾ Reference Table Validation', '▾ Validasi Tabel Referensi')));
+    wrap.appendChild(header);
+
+    const body = el('div', { class: 'st-collapsible-body', style: { display: 'none' } });
+
+    const tblCard = el('div', { class: 'st-ref-table' });
+    stRow(tblCard, t('Requested α', 'α diminta'), r.alpha);
+    if (r.tableAlpha !== undefined) stRow(tblCard, t('Table α (one-tailed)', 'α tabel (satu ekor)'), r.tableAlpha);
+    stRow(tblCard, t('Reference', 'Referensi'), 't Student table');
+
+    if (r.tableAvailable) {
+      stRow(tblCard, t('Reference table value', 'Nilai tabel'), r.tableValue);
+      const exactVal = r.criticalValueAbs != null ? r.criticalValueAbs : r.tCriticalAbs;
+      stRow(tblCard, t('Exact calculation', 'Kalkulasi eksak'), exactVal != null ? exactVal.toFixed(6) : '—');
+      if (exactVal != null) {
+        const diff = Math.abs(exactVal - r.tableValue);
+        const passEl = el('span', {
+          style: { color: diff <= 0.005 ? '#15803d' : '#92400e', fontWeight: '600' }
+        }, diff.toFixed(6) + (diff <= 0.005
+          ? ' ✓ ' + t('Within expected rounding', 'Dalam batas pembulatan')
+          : ' ⚠ ' + t('Check', 'Periksa')));
+        stRow(tblCard, t('Difference', 'Selisih'), passEl);
+        stRow(tblCard, t('Tolerance', 'Toleransi'), '0.005');
+        stRow(tblCard, t('Status', 'Status'), diff <= 0.005
+          ? t('✓ Within expected table rounding', '✓ Dalam pembulatan tabel yang wajar')
+          : t('⚠ Exceeds tolerance', '⚠ Melebihi toleransi'));
+      }
+    } else {
+      stRow(tblCard, t('Table df', 'df di tabel'),
+        r.tableDF ? t('df in table', 'df tersedia') : t('Not in reference table — exact used', 'Tidak ada di tabel — eksak digunakan'));
+      stRow(tblCard, t('Method', 'Metode'), r.method || 'exact');
+    }
+
+    body.appendChild(tblCard);
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  /** Interpretation paragraph */
+  function interpretationBlock(r) {
+    const wrap = el('div', { class: 'st-interp-block' });
+    wrap.appendChild(el('div', { class: 'st-section-title' }, t('Interpretation', 'Interpretasi')));
+    let text = '';
+    if (r.mode === 'critical') {
+      const ta = r.tableAlpha || r.alpha;
+      const cv = (r.criticalValueAbs || 0).toFixed(3);
+      if (r.tail === 'two-tailed') {
+        text = t(
+          `For a two-tailed test with α = ${r.alpha}, the significance level is divided equally: α / 2 = ${ta}. With df = ${r.df}, the critical value is approximately ±${cv}.`,
+          `Untuk uji dua sisi dengan α = ${r.alpha}, tingkat signifikansi dibagi dua: α / 2 = ${ta}. Dengan df = ${r.df}, nilai kritis sekitar ±${cv}.`
+        );
+      } else if (r.tail === 'right') {
+        text = t(
+          `For a right-tailed test with α = ${r.alpha} and df = ${r.df}, the critical value is +${cv}. Reject H₀ when t > +${cv}.`,
+          `Untuk uji ekor kanan dengan α = ${r.alpha} dan df = ${r.df}, nilai kritis adalah +${cv}. Tolak H₀ jika t > +${cv}.`
+        );
+      } else {
+        text = t(
+          `For a left-tailed test with α = ${r.alpha} and df = ${r.df}, the critical value is −${cv}. Reject H₀ when t < −${cv}.`,
+          `Untuk uji ekor kiri dengan α = ${r.alpha} dan df = ${r.df}, nilai kritis adalah −${cv}. Tolak H₀ jika t < −${cv}.`
+        );
+      }
+    } else if (r.mode === 'test') {
+      const ta = r.tableAlpha || r.alpha;
+      const cv = (r.tCriticalAbs || 0).toFixed(3);
+      const alphaNote = r.tail === 'two-tailed'
+        ? t(` (two-tailed: table α = ${ta})`, ` (dua sisi: α tabel = ${ta})`)
+        : '';
+      text = r.reject
+        ? t(`t = ${r.tObserved}, df = ${r.df}, α = ${r.alpha}${alphaNote}: t critical = ${r.tail === 'two-tailed' ? '±' : ''}${cv}. p = ${r.pValue.toFixed(4)} < α. Reject H₀.`,
+            `t = ${r.tObserved}, df = ${r.df}, α = ${r.alpha}${alphaNote}: t kritis = ${r.tail === 'two-tailed' ? '±' : ''}${cv}. p = ${r.pValue.toFixed(4)} < α. Tolak H₀.`)
+        : t(`t = ${r.tObserved}, df = ${r.df}, α = ${r.alpha}${alphaNote}: t critical = ${r.tail === 'two-tailed' ? '±' : ''}${cv}. p = ${r.pValue.toFixed(4)} ≥ α. Fail to reject H₀.`,
+            `t = ${r.tObserved}, df = ${r.df}, α = ${r.alpha}${alphaNote}: t kritis = ${r.tail === 'two-tailed' ? '±' : ''}${cv}. p = ${r.pValue.toFixed(4)} ≥ α. Gagal menolak H₀.`);
+    } else if (r.mode === 'probability') {
+      text = t(
+        `t = ${r.t.toFixed(4)}, df = ${r.df}: the ${r.tail} p-value is ${r.pValue.toFixed(4)}.`,
+        `t = ${r.t.toFixed(4)}, df = ${r.df}: p-value ${r.tail} adalah ${r.pValue.toFixed(4)}.`
+      );
+    }
+    wrap.appendChild(el('p', { class: 'st-interp-text' }, text));
+    return wrap;
+  }
+
+  /* ── Syntax block ── */
+  function renderSyntax(container, r) {
+    let syntax = '';
+    if (r.mode === 'critical') {
+      syntax = `T_DISTRIBUTION\n /DF=${r.df}\n /ALPHA=${r.alpha}\n /TAIL=${r.tail === 'two-tailed' ? 'TWO' : r.tail === 'right' ? 'RIGHT' : 'LEFT'}.`;
+    } else if (r.mode === 'probability') {
+      syntax = `T_PROBABILITY\n /DF=${r.df}\n /T=${r.t}\n /TAIL=${r.tail === 'two-tailed' ? 'TWO' : r.tail === 'right' ? 'RIGHT' : 'LEFT'}.`;
+    } else if (r.mode === 'test') {
+      syntax = `T_TEST_STAT\n /T_OBSERVED=${r.tObserved}\n /DF=${r.df}\n /ALPHA=${r.alpha}\n /TAIL=${r.tail === 'two-tailed' ? 'TWO' : r.tail === 'right' ? 'RIGHT' : 'LEFT'}.`;
+    }
+    if (!syntax) return;
+    container.appendChild(el('details', { class: 'st-syntax-details' },
+      el('summary', { class: 'st-syntax-summary' }, t('SOCIOSTAT Syntax', 'Sintaks SOCIOSTAT')),
+      el('pre', { class: 'st-syntax-pre' }, syntax)
+    ));
+  }
+
+  /* ── Export to Output viewer ── */
+  function exportToOutput(r) {
+    if (!r) return;
+    const lines = [];
+    lines.push("STUDENT'S t DISTRIBUTION");
+    lines.push('─'.repeat(50));
+    if (r.mode === 'critical') {
+      lines.push(`Mode: ${t('Find Critical t', 'Cari t Kritis')}`);
+      lines.push(`df = ${r.df}`);
+      lines.push(`α = ${r.alpha}  |  Tail: ${r.tail}`);
+      if (r.tableAlpha !== undefined) lines.push(`Table α = ${r.tableAlpha}`);
+      lines.push(`t critical = ${r.tail === 'two-tailed' ? '±' + r.criticalValueAbs.toFixed(6) : r.criticalValue.toFixed(6)}`);
+      if (r.tableAvailable) lines.push(`Reference table value = ${r.tableValue}`);
+      lines.push(`Method: ${r.method}`);
+    } else if (r.mode === 'probability') {
+      lines.push(`Mode: ${t('Probability', 'Probabilitas')}`);
+      lines.push(`df = ${r.df}  |  t = ${r.t}  |  Tail: ${r.tail}`);
+      lines.push(`P = ${r.probability.toFixed(7)} (${r.percentage.toFixed(4)}%)`);
+      lines.push(`p-value = ${r.pValue.toFixed(7)}`);
+    } else if (r.mode === 'test') {
+      lines.push(`Mode: ${t('Test t Statistic', 'Uji Statistik t')}`);
+      lines.push(`t observed = ${r.tObserved}  |  df = ${r.df}  |  α = ${r.alpha}  |  Tail: ${r.tail}`);
+      lines.push(`t critical = ${r.tail === 'two-tailed' ? '±' + r.tCriticalAbs.toFixed(6) : r.tCritical.toFixed(6)}`);
+      lines.push(`p-value = ${r.pValue.toFixed(7)}`);
+      lines.push(`Decision: ${r.decision}`);
+    }
+
+    const htmlRows = lines.slice(2).map(l => {
+      const sep = l.indexOf(' = ');
+      if (sep > -1) {
+        return `<tr><td>${l.slice(0, sep).trim()}</td><td><strong>${l.slice(sep + 3).trim()}</strong></td></tr>`;
+      }
+      return `<tr><td colspan="2">${l}</td></tr>`;
+    }).join('');
+
+    const htmlOutput = `
+      <div class="output-section">
+        <h3 class="output-title">Student's t Distribution</h3>
+        <table class="pivot-table">
+          <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+          <tbody>${htmlRows}</tbody>
+        </table>
+      </div>`;
+
+    if (typeof Output !== 'undefined') {
+      Output.addResult('student_t', {
+        status: 'complete',
+        result: { html: htmlOutput, text: lines.join('\n'), data: r },
+        warnings: []
+      }, { distribution: 'student_t' });
+      if (typeof App !== 'undefined') App.navigate('output');
+      notify(t('Added to Output', 'Ditambahkan ke Output'), 'success');
+    }
+  }
+
+  /* ════════════════════════════════════════════════════
+     MODE D: DIAGNOSTICS — Golden Tests + Reference Comparison
+  ════════════════════════════════════════════════════ */
+
+  function renderDiagnosticsMode(container) {
+    // ── Section header ──
+    container.appendChild(el('div', { class: 'st-section-title' },
+      t('🔬 Validation & Diagnostics', '🔬 Validasi & Diagnostik')));
+
+    container.appendChild(el('p', { class: 'st-interp-text', style: { margin: '0 0 12px' } },
+      t(
+        'Run automated golden tests and compare exact calculations against the reference "t Student" table (Tabel_Nilai_Kritis). All tests must pass for the module to be considered complete.',
+        'Jalankan uji otomatis dan bandingkan kalkulasi eksak dengan tabel referensi "t Student". Semua uji harus lulus agar modul dinyatakan lengkap.'
+      )
+    ));
+
+    // ── Golden Tests ──
+    const gtSection = el('div', { class: 'st-result-key', style: { marginBottom: '14px' } });
+    gtSection.appendChild(el('div', { class: 'st-result-section-title' },
+      t('GOLDEN TESTS (8 tests)', 'UJI GOLDEN (8 uji)')));
+    const gtBody = el('div');
+    gtSection.appendChild(gtBody);
+    container.appendChild(gtSection);
+
+    const gtBtn = el('button', {
+      class: 'btn btn-primary st-calc-btn',
+      style: { margin: '0 0 14px', alignSelf: 'flex-start' },
+      onclick: () => runGoldenTestsUI(gtBody)
+    }, t('▶ Run Golden Tests', '▶ Jalankan Uji Golden'));
+    // Insert button before the section
+    container.insertBefore(gtBtn, gtSection);
+
+    // ── Reference Comparison ──
+    const rcSection = el('div', { class: 'st-result-key', style: { marginBottom: '14px' } });
+    rcSection.appendChild(el('div', { class: 'st-result-section-title' },
+      t('REFERENCE TABLE COMPARISON', 'PERBANDINGAN TABEL REFERENSI')));
+    const rcBody = el('div');
+    rcSection.appendChild(rcBody);
+    container.appendChild(rcSection);
+
+    const rcBtn = el('button', {
+      class: 'btn st-calc-btn',
+      style: { margin: '0 0 14px', alignSelf: 'flex-start', background: 'var(--surface-2,#f1f5f9)', color: 'var(--text,#1f2328)', border: '1px solid var(--border,#e5e7eb)' },
+      onclick: () => runRefComparisonUI(rcBody)
+    }, t('▶ Run Reference Comparison', '▶ Jalankan Perbandingan Referensi'));
+    container.insertBefore(rcBtn, rcSection);
+  }
+
+  function runGoldenTestsUI(container) {
+    container.innerHTML = '';
+    const tests = StudentTCalc.runGoldenTests();
+    const passCount = tests.filter(t => t.pass).length;
+    const allPass = passCount === tests.length;
+
+    const summary = el('div', {
+      class: 'st-result-section-title',
+      style: { color: allPass ? '#15803d' : '#dc2626', marginBottom: '8px' }
+    }, allPass
+      ? `✓ ALL ${passCount}/${tests.length} TESTS PASSED`
+      : `⚠ ${passCount}/${tests.length} PASSED — ${tests.length - passCount} FAILED`);
+    container.appendChild(summary);
+
+    tests.forEach(test => {
+      const row = el('div', {
+        class: 'prob-result-row',
+        style: { alignItems: 'flex-start', padding: '5px 0', borderBottom: '1px solid var(--border,#e5e7eb)' }
+      });
+
+      const statusEl = el('span', {
+        style: {
+          fontWeight: '700', minWidth: '52px', display: 'inline-block',
+          color: test.pass ? '#15803d' : '#dc2626'
+        }
+      }, test.pass ? '✓ PASS' : '✗ FAIL');
+
+      const nameEl = el('span', { class: 'prob-result-label', style: { flex: '1' } }, test.name);
+
+      const expEl = el('span', { class: 'prob-result-value', style: { minWidth: '90px', textAlign: 'right' } },
+        t('Expected: ', 'Ekspektasi: ') + test.expected);
+
+      let gotStr = '—';
+      if (test.result && !test.result.error) {
+        if (test.result.criticalValue != null) gotStr = test.result.criticalValueAbs != null
+          ? test.result.criticalValueAbs.toFixed(4) : test.result.criticalValue.toFixed(4);
+        else if (test.result.pValue != null) gotStr = test.result.pValue.toFixed(6);
+        else if (test.result.probability != null) gotStr = test.result.probability.toFixed(6);
+      } else if (test.error) {
+        gotStr = 'ERROR: ' + test.error;
+      }
+      const gotEl = el('span', { class: 'prob-result-value', style: { minWidth: '110px', textAlign: 'right', fontFamily: 'monospace' } },
+        t('Got: ', 'Hasil: ') + gotStr);
+
+      row.appendChild(statusEl);
+      row.appendChild(nameEl);
+      row.appendChild(expEl);
+      row.appendChild(gotEl);
+      container.appendChild(row);
+    });
+
+    // Export to Output button
+    const exportBtn = el('button', {
+      class: 'btn btn-sm',
+      style: { marginTop: '10px' },
+      onclick: () => exportGoldenTestsToOutput(tests)
+    }, '📋 ' + t('Add to Output', 'Tambahkan ke Output'));
+    container.appendChild(exportBtn);
+  }
+
+  function runRefComparisonUI(container) {
+    container.innerHTML = '';
+    const results = StudentTCalc.referenceComparison();
+    const passCount = results.filter(r => r.pass).length;
+    const allPass = passCount === results.length;
+
+    const summary = el('div', {
+      class: 'st-result-section-title',
+      style: { color: allPass ? '#15803d' : '#dc2626', marginBottom: '8px' }
+    }, allPass
+      ? `✓ ALL ${passCount}/${results.length} REFERENCE ENTRIES MATCH`
+      : `⚠ ${passCount}/${results.length} MATCH — ${results.length - passCount} OUTSIDE TOLERANCE (±0.005)`);
+    container.appendChild(summary);
+
+    // Build table
+    const tbl = el('table', {
+      class: 'pivot-table',
+      style: { fontSize: '11px', width: '100%', marginTop: '6px' }
+    });
+    const thead = el('thead');
+    thead.appendChild(el('tr', {},
+      el('th', {}, 'df'),
+      el('th', {}, 'α (one-tailed)'),
+      el('th', {}, t('Table value', 'Nilai tabel')),
+      el('th', {}, t('Exact', 'Eksak')),
+      el('th', {}, t('Diff', 'Selisih')),
+      el('th', {}, t('Status', 'Status'))
+    ));
+    tbl.appendChild(thead);
+
+    const tbody = el('tbody');
+    results.forEach(r => {
+      const statusEl = el('td', {
+        style: { fontWeight: '700', color: r.pass ? '#15803d' : '#dc2626' }
+      }, r.pass ? '✓' : '✗');
+      const tr = el('tr', {},
+        el('td', {}, r.df),
+        el('td', {}, r.alpha),
+        el('td', {}, r.tableValue.toFixed(3)),
+        el('td', { style: { fontFamily: 'monospace' } }, r.exactValue.toFixed(6)),
+        el('td', { style: { fontFamily: 'monospace' } }, r.diff.toFixed(6)),
+        statusEl
+      );
+      tbody.appendChild(tr);
+    });
+    tbl.appendChild(tbody);
+    container.appendChild(tbl);
+
+    container.appendChild(el('div', { class: 'st-hint', style: { marginTop: '6px' } },
+      t('Tolerance: ±0.005 (reference table values are rounded to 3 decimal places)',
+        'Toleransi: ±0.005 (nilai tabel referensi dibulatkan ke 3 angka desimal)')
+    ));
+
+    // Export
+    const exportBtn = el('button', {
+      class: 'btn btn-sm',
+      style: { marginTop: '10px' },
+      onclick: () => exportRefComparisonToOutput(results)
+    }, '📋 ' + t('Add to Output', 'Tambahkan ke Output'));
+    container.appendChild(exportBtn);
+  }
+
+  function exportGoldenTestsToOutput(tests) {
+    const passCount = tests.filter(t => t.pass).length;
+    const rows = tests.map(test => {
+      let gotStr = '—';
+      if (test.result && !test.result.error) {
+        if (test.result.criticalValueAbs != null) gotStr = test.result.criticalValueAbs.toFixed(4);
+        else if (test.result.criticalValue != null) gotStr = test.result.criticalValue.toFixed(4);
+        else if (test.result.pValue != null) gotStr = test.result.pValue.toFixed(6);
+        else if (test.result.probability != null) gotStr = test.result.probability.toFixed(6);
+      }
+      return `<tr>
+        <td style="color:${test.pass?'#15803d':'#dc2626'};font-weight:700">${test.pass?'✓ PASS':'✗ FAIL'}</td>
+        <td>${test.name}</td>
+        <td>${test.expected}</td>
+        <td style="font-family:monospace">${gotStr}</td>
+      </tr>`;
+    }).join('');
+
+    const htmlOutput = `<div class="output-section">
+      <h3 class="output-title">Student's t Distribution — Golden Tests</h3>
+      <p style="margin:4px 0 8px;font-weight:700;color:${passCount===tests.length?'#15803d':'#dc2626'}">
+        ${passCount}/${tests.length} tests passed
+      </p>
+      <table class="pivot-table" style="font-size:12px">
+        <thead><tr><th>Status</th><th>Test</th><th>Expected</th><th>Got</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+
+    if (typeof Output !== 'undefined') {
+      Output.addResult('student_t', {
+        status: 'complete',
+        result: { html: htmlOutput, text: `Golden Tests: ${passCount}/${tests.length} passed`, data: tests },
+        warnings: []
+      }, { distribution: 'student_t' });
+      if (typeof App !== 'undefined') App.navigate('output');
+      notify(t('Added to Output', 'Ditambahkan ke Output'), 'success');
+    }
+  }
+
+  function exportRefComparisonToOutput(results) {
+    const passCount = results.filter(r => r.pass).length;
+    const rows = results.map(r => `<tr>
+      <td>${r.df}</td><td>${r.alpha}</td>
+      <td>${r.tableValue.toFixed(3)}</td>
+      <td style="font-family:monospace">${r.exactValue.toFixed(6)}</td>
+      <td style="font-family:monospace">${r.diff.toFixed(6)}</td>
+      <td style="font-weight:700;color:${r.pass?'#15803d':'#dc2626'}">${r.pass?'✓':'✗'}</td>
+    </tr>`).join('');
+
+    const htmlOutput = `<div class="output-section">
+      <h3 class="output-title">Student's t Distribution — Reference Table Comparison</h3>
+      <p style="margin:4px 0 8px;font-weight:700;color:${passCount===results.length?'#15803d':'#dc2626'}">
+        ${passCount}/${results.length} entries within tolerance (±0.005)
+      </p>
+      <table class="pivot-table" style="font-size:11px">
+        <thead><tr><th>df</th><th>α</th><th>Table</th><th>Exact</th><th>Diff</th><th>Status</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p style="font-size:11px;color:#6b7280;margin-top:6px">Tolerance: ±0.005 (table values rounded to 3 dp)</p>
+    </div>`;
+
+    if (typeof Output !== 'undefined') {
+      Output.addResult('student_t', {
+        status: 'complete',
+        result: { html: htmlOutput, text: `Reference comparison: ${passCount}/${results.length} within tolerance`, data: results },
+        warnings: []
+      }, { distribution: 'student_t' });
+      if (typeof App !== 'undefined') App.navigate('output');
+      notify(t('Added to Output', 'Ditambahkan ke Output'), 'success');
+    }
+  }
+
+  return { open };
+})();
+
+/* ══════════════════════════════════════════════════════════════════
    SECTION 5: TRANSFORMATION ENGINE
    ══════════════════════════════════════════════════════════════════ */
 
@@ -2051,38 +4950,61 @@ const ImportWizard = (() => {
   let _state = {};
 
   function inferType(values) {
-    const nonEmpty = values.filter(v=>v!=null&&v!=='');
+    const nonEmpty = values.filter(v => v != null && v !== '');
     if (!nonEmpty.length) return 'string';
-    const allNum = nonEmpty.every(v=>!isNaN(Number(v))&&v!=='');
-    if (allNum) return 'numeric';
-    const dateRx = /^\d{4}-\d{2}-\d{2}$/;
-    const allDate = nonEmpty.every(v=>dateRx.test(String(v)));
-    if (allDate) return 'date';
+
+    // Boolean check first
+    const boolSet = new Set(['true','false','yes','no','1','0','y','n','t','f']);
+    if (nonEmpty.every(v => boolSet.has(String(v).trim().toLowerCase()))) return 'boolean';
+
+    // Date check (ISO YYYY-MM-DD or common date strings)
+    const dateRx = /^\d{4}-\d{2}-\d{2}(T.*)?$/;
+    if (nonEmpty.every(v => dateRx.test(String(v).trim()))) return 'date';
+
+    // Numeric check — use semantic parser to handle currency/locale formats
+    if (typeof DataTypeConverter !== 'undefined') {
+      if (nonEmpty.every(v => typeof v === 'number' || DataTypeConverter.parseSemanticNumber(v) !== null)) {
+        return 'numeric';
+      }
+    } else {
+      // Fallback: plain numeric only
+      if (nonEmpty.every(v => !isNaN(Number(v)) && v !== '')) return 'numeric';
+    }
+
     return 'string';
   }
 
   function inferLevel(type, uniqueCount, totalCount) {
-    if (type==='string') return 'nominal';
-    if (type==='numeric') {
-      if (uniqueCount<=10) return 'ordinal';
-      return 'scale';
-    }
+    // Numeric variables default to scale — do NOT infer ordinal from unique count alone.
+    // The user can explicitly change this.
+    if (type === 'numeric') return 'scale';
+    if (type === 'boolean') return 'nominal';
+    if (type === 'date' || type === 'datetime') return 'nominal';
+    // String → nominal
     return 'nominal';
   }
 
   function buildVariables(headers, columns) {
     return headers.map((h, i) => {
       const vals = columns[i] || [];
-      const nonEmpty = vals.filter(v=>v!=null&&v!=='');
+      const nonEmpty = vals.filter(v => v != null && v !== '');
       const unique = new Set(nonEmpty.map(String)).size;
       const type = inferType(vals);
       const level = inferLevel(type, unique, nonEmpty.length);
+      // Detect display format for numeric columns
+      let displayFormat = 'general';
+      if (type === 'numeric' && typeof DataTypeConverter !== 'undefined' && nonEmpty.length > 0) {
+        const { format } = DataTypeConverter.detectColumnFormat(nonEmpty);
+        if (format === 'currency_usd') displayFormat = 'currency_usd';
+        else if (format === 'currency_idr') displayFormat = 'currency_idr';
+        else if (format === 'percent') displayFormat = 'percent';
+      }
       return {
         id: uuid(), name: h.replace(/\s+/g,'_').replace(/[^a-zA-Z0-9_]/g,''),
-        label: h, type, width:8, decimals:type==='numeric'?2:0,
-        valueLabels:{}, missingValues:[], measurementLevel:level,
-        role:'input', visibility:true,
-        _inferred:{ type, level, unique, n:nonEmpty.length }
+        label: h, type, width: 8, decimals: type === 'numeric' ? 2 : 0,
+        valueLabels: {}, missingValues: [], measurementLevel: level,
+        role: 'input', visibility: true, displayFormat,
+        _inferred: { type, level, unique, n: nonEmpty.length }
       };
     });
   }
@@ -2322,7 +5244,16 @@ const ImportWizard = (() => {
       const tr=el('tr');
       // Name editable
       const nameInput=el('input',{type:'text',value:v.name,class:'cell-input',
-        onchange:e=>_state.variables[i].name=e.target.value.replace(/\s+/g,'_')});
+        onchange:e=>{
+          // Apply the same sanitisation as buildVariables so that the name
+          // stored in metadata always matches what doImport uses as the case key.
+          const sanitized = e.target.value.trim()
+            .replace(/\s+/g,'_')
+            .replace(/[^a-zA-Z0-9_]/g,'')
+            || v.name;  // fall back to original if result is empty
+          e.target.value = sanitized;
+          _state.variables[i].name = sanitized;
+        }});
       tr.appendChild(el('td',{},nameInput));
       tr.appendChild(el('td',{},v.label));
       // Type selector
@@ -2413,8 +5344,17 @@ const ImportWizard = (() => {
           return;
         }
         if (v.type === 'numeric') {
-          const n = Number(raw);
-          c[v.name] = isNaN(n) ? null : n;
+          // Use semantic parser to handle currency, locale, percentage formats.
+          // Fall back to plain Number() for already-numeric values.
+          if (typeof raw === 'number') {
+            c[v.name] = isFinite(raw) ? raw : null;
+          } else if (typeof DataTypeConverter !== 'undefined') {
+            const parsed = DataTypeConverter.parseSemanticNumber(raw);
+            c[v.name] = parsed !== null ? parsed.value : null;
+          } else {
+            const n = Number(raw);
+            c[v.name] = isNaN(n) ? null : n;
+          }
         } else {
           c[v.name] = raw;
         }
@@ -2447,6 +5387,25 @@ const ImportWizard = (() => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
+
+    // ── Post-import schema validation ────────────────────────────
+    // Verify that every variable name is present as a key in every case row.
+    // This catches any edge case where name sanitisation produced a mismatch.
+    if (typeof DataIntegrity !== 'undefined') {
+      const integrity = DataIntegrity.check(dataset);
+      if (!integrity.ok) {
+        // Attempt automatic migration before handing off
+        const migration = DataIntegrity.migrateSchema(dataset);
+        if (migration.migrated) {
+          console.warn('[ImportWizard] Schema auto-migrated after import:', migration.changes);
+        } else if (integrity.mismatchedVars.length > 0 || integrity.orphanCaseKeys.length > 0) {
+          console.error('[ImportWizard] Post-import integrity check FAILED:', integrity);
+        }
+      }
+      dataset.metadata.schemaVersion = 2;
+      dataset.metadata.integrityCheckAt = new Date().toISOString();
+      dataset.metadata.integrityOk = integrity.ok;
+    }
 
     overlay.remove();
     if (typeof _state.onImport === 'function') _state.onImport(dataset);
@@ -2748,6 +5707,34 @@ const DataView = (() => {
     const pasteBtn=el('button',{class:'btn btn-sm btn-paste',style:'display:'+(hasSel?'':'none'),title:'Paste (Ctrl+V)',onclick:()=>pasteSelected()},'Paste');
     const delBtn=el('button',{class:'btn btn-sm btn-danger btn-delrow',style:'display:'+(hasSel?'':'none'),onclick:()=>deleteSelectedRow(dataset)},'Del Row');
     btnGroup.appendChild(copyBtn); btnGroup.appendChild(pasteBtn); btnGroup.appendChild(delBtn);
+    // Inspect button — opens DataIntegrity report in a modal overlay
+    btnGroup.appendChild(el('button', {
+      class: 'btn btn-sm',
+      title: 'Inspect dataset schema and numeric integrity',
+      onclick: () => {
+        const existing = document.getElementById('data-integrity-overlay');
+        if (existing) { existing.remove(); return; }
+        const rpt = typeof DataIntegrity !== 'undefined' ? DataIntegrity.report(dataset) : '<p>DataIntegrity not available.</p>';
+        const ov = el('div', {
+          id: 'data-integrity-overlay',
+          style: {
+            position: 'fixed', top: '60px', right: '16px', zIndex: '9999',
+            width: 'min(700px,96vw)', maxHeight: '70vh',
+            background: '#1e1e2e', border: '1px solid #313244',
+            borderRadius: '10px', boxShadow: '0 8px 32px rgba(0,0,0,.45)',
+            overflow: 'hidden', display: 'flex', flexDirection: 'column',
+          }
+        });
+        const hdr = el('div', { style: { display:'flex', justifyContent:'space-between', alignItems:'center', padding:'10px 14px', background:'#181825', borderBottom:'1px solid #313244' } },
+          el('span', { style: { color:'#cdd6f4', fontWeight:'700', fontSize:'13px', fontFamily:'monospace' } }, '🔍 Data Integrity Report'),
+          el('button', { style: { background:'none', border:'none', color:'#cdd6f4', cursor:'pointer', fontSize:'18px', lineHeight:'1' }, onclick: () => ov.remove() }, '×')
+        );
+        const body = el('div', { style: { overflow:'auto', flex:'1' } });
+        body.innerHTML = rpt;
+        ov.appendChild(hdr); ov.appendChild(body);
+        document.body.appendChild(ov);
+      }
+    }, '🔍 Inspect'));
     toolbar.appendChild(btnGroup);
     const pgDiv=el('div',{class:'data-toolbar-page'});
     pgDiv.appendChild(el('span',{class:'small muted'},(start+1)+'\u2013'+end+' of '+total));
@@ -3260,7 +6247,68 @@ const VariableView = (() => {
       nameCell.append(nameSpan, renameBtn);
       tr.appendChild(nameCell);
       tr.appendChild(el('td',{},mkInput('label')));
-      tr.appendChild(el('td',{},mkSelect('type',['numeric','string','date','datetime','boolean'])));
+
+      // ── Type dropdown — triggers real conversion dialog ──────────
+      const typeCell = el('td');
+      const typeOptions = ['numeric','string','date','datetime','boolean'];
+      const typeSel = el('select', { class: 'cell-input' });
+      typeOptions.forEach(o => {
+        const opt = el('option', { value: o }, o);
+        if (o === v.type) opt.selected = true;
+        typeSel.appendChild(opt);
+      });
+      // Type badge showing N/S/D/B
+      const TYPE_BADGE = { numeric: 'N', string: 'S', date: 'D', datetime: 'DT', boolean: 'B' };
+      const TYPE_TITLE = {
+        numeric: 'N • Numeric',
+        string: 'S • String',
+        date: 'D • Date',
+        datetime: 'DT • DateTime',
+        boolean: 'B • Boolean',
+      };
+      const typeBadge = el('span', {
+        class: 'var-type-badge',
+        title: TYPE_TITLE[v.type] || v.type,
+        style: { cursor: 'default', userSelect: 'none' }
+      }, TYPE_BADGE[v.type] || '?');
+      typeSel.addEventListener('change', e => {
+        const targetType = e.target.value;
+        const currentType = dataset.variables[idx].type;
+        if (targetType === currentType) return;
+        // Show conversion dialog
+        if (typeof DataTypeConverter !== 'undefined') {
+          DataTypeConverter.showConversionDialog(dataset, v.name, targetType, (onInvalid) => {
+            if (onInvalid === 'nochange' || onInvalid === 'noop') {
+              typeSel.value = currentType;
+              return;
+            }
+            const result = DataTypeConverter.convertVariable(dataset, v.name, targetType, onInvalid);
+            if (result.error) {
+              notify('Conversion failed: ' + result.error, 'error');
+              typeSel.value = currentType;
+              return;
+            }
+            dataset.updatedAt = new Date().toISOString();
+            Project.markDirty();
+            const msg = `Converted ${v.name}: ${result.converted} values → ${targetType}` +
+              (result.errors > 0 ? `, ${result.errors} set missing` : '');
+            notify(msg, 'success');
+            render(dataset);  // re-render Variable View to reflect new type
+            // Also refresh Data View if it's active
+            if (typeof DataView !== 'undefined') DataView.render(dataset);
+          });
+          // Immediately reset select to current type — dialog will handle change
+          typeSel.value = currentType;
+        } else {
+          // Fallback: direct metadata change only (no conversion engine)
+          dataset.variables[idx].type = targetType;
+          dataset.updatedAt = new Date().toISOString();
+          Project.markDirty();
+        }
+      });
+      typeCell.appendChild(typeBadge);
+      typeCell.appendChild(typeSel);
+      tr.appendChild(typeCell);
       tr.appendChild(el('td',{},mkInput('width','number',v.width)));
       tr.appendChild(el('td',{},mkInput('decimals','number',v.decimals)));
       // Value labels button
@@ -3886,6 +6934,740 @@ const AnalysisDialogs = (() => {
 })();
 
 /* ══════════════════════════════════════════════════════════════════
+   SECTION 9B: PROBABILITY & DISTRIBUTIONS CALCULATOR UI
+   Accessible from Analyze → Probability & Distributions.
+   Also invoked by AI commands and [Explain Z] buttons.
+   ══════════════════════════════════════════════════════════════════ */
+
+const ProbabilityCalcUI = (() => {
+
+  let _activeSubTab = 'calc';  // 'calc'|'critical'|'pvalue'|'examples'
+
+  /* ── open() — Normal Probability Calculator (standalone) ── */
+  function open(prefillZ) {
+    const existing = document.getElementById('prob-calc-overlay');
+    if (existing) existing.remove();
+
+    const overlay = el('div', { id: 'prob-calc-overlay', class: 'dialog-overlay' });
+    const box = el('div', { class: 'dialog-box prob-calc-box' });
+
+    // Header — Normal Distribution only
+    box.appendChild(el('div', { class: 'dialog-header' },
+      el('div', { style: { display: 'flex', flexDirection: 'column', gap: '2px' } },
+        el('h2', {}, '📐 Probability Calculator'),
+        el('div', { style: { fontSize: '12px', color: 'var(--text-muted,#6b7280)', fontWeight: '500', marginTop: '1px' } },
+          'Normal Distribution')
+      ),
+      el('button', { class: 'dialog-close', onclick: () => overlay.remove() }, '×')
+    ));
+
+    // Body — directly renders Normal calculator, no distribution switcher tabs
+    const bodyEl = el('div', { class: 'prob-calc-body', id: 'prob-calc-body' });
+    box.appendChild(bodyEl);
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    renderNormalCalc(bodyEl, prefillZ);
+  }
+
+  /* ── Normal Distribution calculator ── */
+  function renderNormalCalc(container, prefillZ) {
+    // Sub-tabs: Calculate | Critical Z | P-Value | Examples
+    const subTabBar = el('div', { class: 'prob-sub-tabs' });
+    const SUB_TABS = [
+      { id: 'calc',     label: 'Calculate P' },
+      { id: 'critical', label: 'Find Critical Z' },
+      { id: 'pvalue',   label: 'P-Value from Z' },
+      { id: 'examples', label: 'Examples' },
+    ];
+    const contentEl = el('div', { class: 'prob-content' });
+
+    function switchSubTab(id) {
+      _activeSubTab = id;
+      subTabBar.querySelectorAll('.prob-sub-tab').forEach(b => b.classList.toggle('active', b.dataset.id === id));
+      contentEl.innerHTML = '';
+      if (id === 'calc') renderCalcTab(contentEl, prefillZ);
+      else if (id === 'critical') renderCriticalTab(contentEl);
+      else if (id === 'pvalue') renderPValueTab(contentEl, prefillZ);
+      else renderExamplesTab(contentEl);
+    }
+
+    SUB_TABS.forEach(st => {
+      const btn = el('button', { class: `prob-sub-tab${_activeSubTab === st.id ? ' active' : ''}`, 'data-id': st.id,
+        onclick: () => switchSubTab(st.id) }, st.label);
+      subTabBar.appendChild(btn);
+    });
+
+    container.appendChild(subTabBar);
+    container.appendChild(contentEl);
+    switchSubTab(_activeSubTab);
+  }
+
+  /* ── Tab: Calculate P ── */
+  function renderCalcTab(container, prefillZ) {
+    const state = {
+      inputMode: 'z',       // 'z' | 'raw'
+      tailType: 'left',     // 'left'|'right'|'between'|'two'
+      calcMethod: 'exact',  // 'exact'|'table'
+      z: prefillZ != null ? String(prefillZ) : '',
+      x: '', x1: '', x2: '',
+      z1: '', z2: '',
+      mean: '0', sd: '1',
+    };
+
+    // Simple-mode explainer
+    if (typeof _appMode !== 'undefined' && _appMode === 'simple') {
+      container.appendChild(el('div', { class: 'prob-explainer' },
+        el('div', { class: 'prob-explainer-title' }, '💡 What is Z?'),
+        el('p', {}, 'A Z-score tells you how many standard deviations a value is from the mean. Z = 0 means exactly average.'),
+        el('div', { class: 'prob-explainer-title' }, '💡 What is probability here?'),
+        el('p', {}, 'Probability is the area under the normal distribution curve for the region you specify. It is always between 0 and 1.')
+      ));
+    }
+
+    // Input mode toggle
+    const modeWrap = el('div', { class: 'prob-row' },
+      el('label', { class: 'prob-section-label' }, 'Input Mode'),
+      el('div', { class: 'prob-toggle-group' },
+        ...[['z','Z-Score'],['raw','Raw Score (X, μ, σ)']].map(([val, lbl]) => {
+          const btn = el('button', {
+            class: `prob-toggle-btn${state.inputMode === val ? ' active' : ''}`,
+            onclick: () => { state.inputMode = val; rebuildForm(); }
+          }, lbl);
+          return btn;
+        })
+      )
+    );
+
+    // Method toggle
+    const methodWrap = el('div', { class: 'prob-row' },
+      el('label', { class: 'prob-section-label' }, 'Method'),
+      el('div', { class: 'prob-toggle-group' },
+        ...[['exact','Exact Calculation'],['table','Use Z Table']].map(([val, lbl]) => {
+          const btn = el('button', {
+            class: `prob-toggle-btn${state.calcMethod === val ? ' active' : ''}`,
+            onclick: () => { state.calcMethod = val; rebuildForm(); }
+          }, lbl);
+          return btn;
+        })
+      )
+    );
+
+    // Tail type
+    const tailWrap = el('div', { class: 'prob-row' },
+      el('label', { class: 'prob-section-label' }, 'Probability Type'),
+      el('div', { class: 'prob-tail-group' },
+        ...[
+          ['left',    'P(Z ≤ z)',     'Left Tail'],
+          ['right',   'P(Z > z)',     'Right Tail'],
+          ['between', 'P(z₁ < Z < z₂)', 'Between'],
+          ['two',     'P(|Z| ≥ |z|)', 'Two-Tailed'],
+        ].map(([val, formula, lbl]) => {
+          const btn = el('button', {
+            class: `prob-tail-btn${state.tailType === val ? ' active' : ''}`,
+            title: formula,
+            onclick: () => { state.tailType = val; rebuildForm(); }
+          }, el('div', { class: 'prob-tail-formula' }, formula), el('div', { class: 'prob-tail-label' }, lbl));
+          return btn;
+        })
+      )
+    );
+
+    // Inputs area
+    const inputsArea = el('div', { class: 'prob-inputs-area' });
+
+    // Results area
+    const resultsArea = el('div', { class: 'prob-results-area', id: 'prob-results-area' });
+
+    // Visualization area
+    const vizArea = el('div', { class: 'prob-viz-area', id: 'prob-viz-area' });
+
+    // Calculate button
+    const calcBtn = el('button', { class: 'btn btn-primary prob-calc-btn', onclick: () => doCalc() }, '⚡ Calculate');
+
+    container.appendChild(modeWrap);
+    container.appendChild(methodWrap);
+    container.appendChild(tailWrap);
+    container.appendChild(inputsArea);
+    container.appendChild(calcBtn);
+    container.appendChild(vizArea);
+    container.appendChild(resultsArea);
+
+    function rebuildModeToggle() {
+      modeWrap.querySelectorAll('.prob-toggle-btn').forEach((b, i) => {
+        b.classList.toggle('active', ['z','raw'][i] === state.inputMode);
+      });
+    }
+    function rebuildMethodToggle() {
+      methodWrap.querySelectorAll('.prob-toggle-btn').forEach((b, i) => {
+        b.classList.toggle('active', ['exact','table'][i] === state.calcMethod);
+      });
+    }
+    function rebuildTailBtns() {
+      tailWrap.querySelectorAll('.prob-tail-btn').forEach((b, i) => {
+        b.classList.toggle('active', ['left','right','between','two'][i] === state.tailType);
+      });
+    }
+
+    function rebuildForm() {
+      rebuildModeToggle();
+      rebuildMethodToggle();
+      rebuildTailBtns();
+      inputsArea.innerHTML = '';
+      const isBetween = state.tailType === 'between';
+      const isRaw = state.inputMode === 'raw';
+
+      function numInput(label, key, placeholder, hint) {
+        const wrap = el('div', { class: 'prob-field' });
+        wrap.appendChild(el('label', { class: 'prob-label' }, label));
+        const inp = el('input', {
+          type: 'text',
+          class: 'form-control prob-input',
+          placeholder,
+          value: state[key] != null ? state[key] : '',
+          oninput: e => { state[key] = e.target.value; },
+          onkeydown: e => { if (e.key === 'Enter') doCalc(); }
+        });
+        wrap.appendChild(inp);
+        if (hint) wrap.appendChild(el('div', { class: 'prob-hint' }, hint));
+        return wrap;
+      }
+
+      if (!isRaw) {
+        if (!isBetween) {
+          inputsArea.appendChild(numInput('Z-Score', 'z', 'e.g. 1.96', 'Enter any real number'));
+        } else {
+          inputsArea.appendChild(numInput('Z₁ (lower)', 'z1', 'e.g. -1.96', 'Lower Z boundary'));
+          inputsArea.appendChild(numInput('Z₂ (upper)', 'z2', 'e.g. 1.96', 'Upper Z boundary'));
+        }
+      } else {
+        if (!isBetween) {
+          inputsArea.appendChild(numInput('X (raw value)', 'x', 'e.g. 130', ''));
+        } else {
+          inputsArea.appendChild(numInput('X₁ (lower value)', 'x1', 'e.g. 90', ''));
+          inputsArea.appendChild(numInput('X₂ (upper value)', 'x2', 'e.g. 110', ''));
+        }
+        inputsArea.appendChild(numInput('Mean (μ)', 'mean', 'e.g. 100', 'Population or sample mean'));
+        inputsArea.appendChild(numInput('Standard Deviation (σ)', 'sd', 'e.g. 15', 'Must be greater than 0'));
+      }
+    }
+
+    function doCalc() {
+      resultsArea.innerHTML = '';
+      vizArea.innerHTML = '';
+
+      const opts = {
+        mode: state.inputMode,
+        tailType: state.tailType,
+        method: state.calcMethod,
+        z: state.z, z1: state.z1, z2: state.z2,
+        x: state.x, x1: state.x1, x2: state.x2,
+        mean: state.mean, sd: state.sd,
+      };
+
+      const result = ProbabilityCalc.calculateNormal(opts);
+      ProbabilityCalc.setLastResult(result);
+
+      if (result.error) {
+        resultsArea.appendChild(el('div', { class: 'prob-error' }, '⚠ ' + result.error));
+        return;
+      }
+
+      renderResults(resultsArea, result);
+      renderVisualization(vizArea, result);
+    }
+
+    rebuildForm();
+
+    // Auto-calculate if prefillZ was provided
+    if (prefillZ != null) setTimeout(doCalc, 50);
+  }
+
+  /* ── Render result cards ── */
+  function renderResults(container, result) {
+    const { z, z1, z2, type, probability, percentage, tableValue, method, mode, x, x1, x2, mean, sd } = result;
+
+    const zDisplay = type === 'between'
+      ? `z₁ = ${z1.toFixed(4)}, z₂ = ${z2.toFixed(4)}`
+      : (z != null ? z.toFixed(6) : '—');
+
+    const card = el('div', { class: 'prob-result-card' });
+
+    // Z display
+    if (mode === 'raw') {
+      const xDisp = type === 'between'
+        ? `X₁ = ${x1}, X₂ = ${x2}, μ = ${mean}, σ = ${sd}`
+        : `X = ${x}, μ = ${mean}, σ = ${sd}`;
+      card.appendChild(el('div', { class: 'prob-result-row prob-result-secondary' }, xDisp));
+      card.appendChild(el('div', { class: 'prob-result-row' },
+        el('span', { class: 'prob-result-label' }, 'Z-Score'),
+        el('span', { class: 'prob-result-value prob-result-z' }, zDisplay)
+      ));
+    } else {
+      card.appendChild(el('div', { class: 'prob-result-row' },
+        el('span', { class: 'prob-result-label' }, 'Z-Score'),
+        el('span', { class: 'prob-result-value prob-result-z' }, zDisplay)
+      ));
+    }
+
+    // Tail type description
+    const tailDesc = {
+      left:    `P(Z ≤ ${z != null ? z.toFixed(4) : 'z'})`,
+      right:   `P(Z > ${z != null ? z.toFixed(4) : 'z'})`,
+      between: `P(${z1 != null ? z1.toFixed(4) : 'z₁'} < Z < ${z2 != null ? z2.toFixed(4) : 'z₂'})`,
+      two:     `P(|Z| ≥ ${z != null ? Math.abs(z).toFixed(4) : '|z|'})`,
+    }[type] || type;
+
+    if (mode === 'raw' && type !== 'between' && x != null) {
+      const xDesc = {
+        left:  `P(X ≤ ${x})`,
+        right: `P(X > ${x})`,
+        two:   `P(|X - μ| ≥ |${x} - ${mean}|)`,
+      }[type];
+      if (xDesc) card.appendChild(el('div', { class: 'prob-result-row prob-result-secondary' }, xDesc));
+    }
+
+    card.appendChild(el('div', { class: 'prob-result-row' },
+      el('span', { class: 'prob-result-label' }, tailDesc),
+      el('div', { class: 'prob-result-value-group' },
+        el('span', { class: 'prob-result-value prob-result-main' }, probability.toFixed(7)),
+        el('span', { class: 'prob-result-pct' }, percentage.toFixed(4) + '%')
+      )
+    ));
+
+    // Table value (if different from exact)
+    if (tableValue != null) {
+      const isSame = Math.abs(probability - tableValue) < 0.00005;
+      card.appendChild(el('div', { class: 'prob-result-row' },
+        el('span', { class: 'prob-result-label' }, 'Table Value (4 dp)'),
+        el('span', { class: 'prob-result-value' + (isSame ? '' : ' prob-result-diff') },
+          tableValue.toFixed(4) + (isSame ? '' : ` ← exact: ${probability.toFixed(7)}`)
+        )
+      ));
+    }
+
+    // Two-tailed breakdown
+    if (type === 'two') {
+      card.appendChild(el('div', { class: 'prob-result-divider' }));
+      card.appendChild(el('div', { class: 'prob-result-row prob-result-secondary' },
+        el('span', {}, `Left tail P(Z ≤ ${(-Math.abs(z)).toFixed(4)})`),
+        el('span', {}, result.leftTail.toFixed(7))
+      ));
+      card.appendChild(el('div', { class: 'prob-result-row prob-result-secondary' },
+        el('span', {}, `Right tail P(Z > ${Math.abs(z).toFixed(4)})`),
+        el('span', {}, result.rightTail.toFixed(7))
+      ));
+    }
+
+    // Significance interpretation
+    if (type === 'two') {
+      const sig = probability < 0.001 ? '*** p < .001' : probability < 0.01 ? '** p < .01' : probability < 0.05 ? '* p < .05' : 'Not significant (p ≥ .05)';
+      card.appendChild(el('div', { class: 'prob-result-row prob-result-secondary' },
+        el('span', { class: probability < 0.05 ? 'prob-sig' : 'prob-ns' }, sig)
+      ));
+    }
+
+    card.appendChild(el('div', { class: 'prob-result-method' }, `Method: ${method === 'exact' ? 'Exact (normCdf)' : 'Z Table (4 dp)'}`));
+
+    // Export button
+    const exportBtn = el('button', { class: 'btn btn-sm prob-export-btn', onclick: () => exportToOutput(result) },
+      '📋 Add to Output');
+    card.appendChild(exportBtn);
+
+    container.appendChild(card);
+  }
+
+  /* ── SVG Normal Curve Visualization ── */
+  function renderVisualization(container, result) {
+    const W = 420, H = 180, pad = { l: 30, r: 30, t: 20, b: 30 };
+    const gW = W - pad.l - pad.r, gH = H - pad.t - pad.b;
+
+    // Normal PDF
+    const zRange = [-3.8, 3.8];
+    const pdf = (z) => Math.exp(-0.5 * z * z) / Math.sqrt(2 * Math.PI);
+    const maxPdf = pdf(0);
+
+    function zToX(z) { return pad.l + (z - zRange[0]) / (zRange[1] - zRange[0]) * gW; }
+    function pToY(p) { return pad.t + gH - (p / maxPdf) * gH * 0.9; }
+
+    // Build path
+    const steps = 200;
+    const pts = [];
+    for (let i = 0; i <= steps; i++) {
+      const z = zRange[0] + (zRange[1] - zRange[0]) * i / steps;
+      pts.push([zToX(z), pToY(pdf(z))]);
+    }
+    const curvePath = 'M' + pts.map(p => p.join(',')).join('L');
+    const baselineY = pad.t + gH;
+
+    // Build shaded region path
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('width', W); svg.setAttribute('height', H);
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.setAttribute('class', 'prob-viz-svg');
+
+    function makeShadePath(zFrom, zTo, color) {
+      const pts2 = [];
+      const s2 = 100;
+      const zF = Math.max(zRange[0], zFrom);
+      const zT = Math.min(zRange[1], zTo);
+      for (let i = 0; i <= s2; i++) {
+        const z = zF + (zT - zF) * i / s2;
+        pts2.push([zToX(z), pToY(pdf(z))]);
+      }
+      const d = `M${zToX(zF)},${baselineY} L${pts2.map(p=>p.join(',')).join('L')} L${zToX(zT)},${baselineY} Z`;
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', d);
+      path.setAttribute('fill', color);
+      path.setAttribute('opacity', '0.35');
+      return path;
+    }
+
+    const { z, z1, z2, type } = result;
+
+    // Shade regions
+    if (type === 'left') {
+      svg.appendChild(makeShadePath(zRange[0], z, '#3b82d4'));
+    } else if (type === 'right') {
+      svg.appendChild(makeShadePath(z, zRange[1], '#e6871e'));
+    } else if (type === 'between') {
+      svg.appendChild(makeShadePath(z1, z2, '#22c55e'));
+    } else if (type === 'two') {
+      svg.appendChild(makeShadePath(zRange[0], -Math.abs(z), '#7c5cd8'));
+      svg.appendChild(makeShadePath(Math.abs(z), zRange[1], '#7c5cd8'));
+    }
+
+    // Curve
+    const curve = document.createElementNS(ns, 'path');
+    curve.setAttribute('d', curvePath);
+    curve.setAttribute('fill', 'none');
+    curve.setAttribute('stroke', 'var(--text-primary, #1f2328)');
+    curve.setAttribute('stroke-width', '2');
+    svg.appendChild(curve);
+
+    // Baseline
+    const baseline = document.createElementNS(ns, 'line');
+    baseline.setAttribute('x1', pad.l); baseline.setAttribute('y1', baselineY);
+    baseline.setAttribute('x2', W - pad.r); baseline.setAttribute('y2', baselineY);
+    baseline.setAttribute('stroke', 'var(--border, #ccc)'); baseline.setAttribute('stroke-width', '1');
+    svg.appendChild(baseline);
+
+    // Z marker(s)
+    function addZMarker(zVal, color, label) {
+      const xPos = zToX(zVal);
+      if (xPos < pad.l - 5 || xPos > W - pad.r + 5) return;
+      const line2 = document.createElementNS(ns, 'line');
+      line2.setAttribute('x1', xPos); line2.setAttribute('y1', pad.t);
+      line2.setAttribute('x2', xPos); line2.setAttribute('y2', baselineY);
+      line2.setAttribute('stroke', color); line2.setAttribute('stroke-width', '1.5');
+      line2.setAttribute('stroke-dasharray', '3,2');
+      svg.appendChild(line2);
+      const txt = document.createElementNS(ns, 'text');
+      txt.setAttribute('x', xPos); txt.setAttribute('y', H - 6);
+      txt.setAttribute('text-anchor', 'middle');
+      txt.setAttribute('font-size', '9');
+      txt.setAttribute('fill', color);
+      txt.textContent = label;
+      svg.appendChild(txt);
+    }
+
+    if (type === 'between') {
+      addZMarker(z1, '#22c55e', `z₁=${z1.toFixed(2)}`);
+      addZMarker(z2, '#22c55e', `z₂=${z2.toFixed(2)}`);
+    } else if (type === 'two') {
+      addZMarker(-Math.abs(z), '#7c5cd8', `z=${(-Math.abs(z)).toFixed(2)}`);
+      addZMarker(Math.abs(z), '#7c5cd8', `z=${Math.abs(z).toFixed(2)}`);
+    } else {
+      const color = type === 'left' ? '#3b82d4' : '#e6871e';
+      addZMarker(z, color, `z=${z.toFixed(2)}`);
+    }
+
+    // μ = 0 marker
+    const muX = zToX(0);
+    const muTxt = document.createElementNS(ns, 'text');
+    muTxt.setAttribute('x', muX); muTxt.setAttribute('y', H - 6);
+    muTxt.setAttribute('text-anchor', 'middle');
+    muTxt.setAttribute('font-size', '9');
+    muTxt.setAttribute('fill', 'var(--text-muted, #777)');
+    muTxt.textContent = 'μ=0';
+    svg.appendChild(muTxt);
+
+    container.appendChild(svg);
+  }
+
+  /* ── Tab: Find Critical Z ── */
+  function renderCriticalTab(container) {
+    const state = { probability: '0.975', tailType: 'left' };
+
+    if (typeof _appMode !== 'undefined' && _appMode === 'simple') {
+      container.appendChild(el('div', { class: 'prob-explainer' },
+        el('p', {}, 'Find the Z value that corresponds to a given probability. For example: if you want P(Z ≤ z) = 0.975, the answer is Z ≈ 1.96.')
+      ));
+    }
+
+    const fieldsEl = el('div', { class: 'prob-inputs-area' });
+    const tailEl = el('div', { class: 'prob-row' });
+    const resultEl = el('div', { class: 'prob-results-area' });
+
+    function rebuild() {
+      fieldsEl.innerHTML = '';
+      tailEl.innerHTML = '';
+
+      fieldsEl.appendChild(el('div', { class: 'prob-field' },
+        el('label', { class: 'prob-label' }, 'Probability (0 < p < 1)'),
+        el('input', { type: 'text', class: 'form-control prob-input', value: state.probability,
+          oninput: e => { state.probability = e.target.value; },
+          onkeydown: e => { if (e.key === 'Enter') calc(); }
+        }),
+        el('div', { class: 'prob-hint' }, 'Common values: 0.95, 0.975, 0.99, 0.995')
+      ));
+
+      tailEl.appendChild(el('label', { class: 'prob-section-label' }, 'Interpretation'));
+      const tg = el('div', { class: 'prob-toggle-group' });
+      [
+        ['left',           'Left tail (P(Z ≤ z) = p)'],
+        ['right',          'Right tail (P(Z > z) = p)'],
+        ['two-confidence', 'Confidence level (e.g. 0.95)'],
+        ['two-alpha',      'Alpha level (e.g. 0.05)'],
+      ].forEach(([val, lbl]) => {
+        const btn = el('button', {
+          class: `prob-toggle-btn${state.tailType === val ? ' active' : ''}`,
+          onclick: () => { state.tailType = val; rebuild(); }
+        }, lbl);
+        tg.appendChild(btn);
+      });
+      tailEl.appendChild(tg);
+    }
+
+    function calc() {
+      resultEl.innerHTML = '';
+      const r = ProbabilityCalc.criticalZ({ probability: state.probability, tailType: state.tailType });
+      if (r.error) { resultEl.appendChild(el('div', { class: 'prob-error' }, '⚠ ' + r.error)); return; }
+
+      const card = el('div', { class: 'prob-result-card' });
+      card.appendChild(el('div', { class: 'prob-result-row' },
+        el('span', { class: 'prob-result-label' }, r.label),
+        el('span', { class: 'prob-result-value prob-result-z' }, `Z = ${r.z.toFixed(6)}`)
+      ));
+      card.appendChild(el('div', { class: 'prob-result-row prob-result-secondary' },
+        el('span', {}, 'Verification: P(Z ≤ z) ='),
+        el('span', {}, r.verification.toFixed(7))
+      ));
+      // Common reference values
+      card.appendChild(el('div', { class: 'prob-result-divider' }));
+      card.appendChild(el('div', { class: 'prob-result-secondary', style: { fontSize: '11px', color: 'var(--text-muted)' } },
+        'Common critical values: Z(0.975) = 1.960 | Z(0.995) = 2.576 | Z(0.950) = 1.645 | Z(0.900) = 1.282'
+      ));
+      resultEl.appendChild(card);
+    }
+
+    rebuild();
+    container.appendChild(fieldsEl);
+    container.appendChild(tailEl);
+    container.appendChild(el('button', { class: 'btn btn-primary prob-calc-btn', onclick: calc }, '⚡ Find Z'));
+    container.appendChild(resultEl);
+    calc();
+  }
+
+  /* ── Tab: P-Value from Z ── */
+  function renderPValueTab(container, prefillZ) {
+    const state = { z: prefillZ != null ? String(prefillZ) : '', alternative: 'two-sided' };
+    const resultEl = el('div', { class: 'prob-results-area' });
+    const vizEl = el('div', { class: 'prob-viz-area' });
+
+    if (typeof _appMode !== 'undefined' && _appMode === 'simple') {
+      container.appendChild(el('div', { class: 'prob-explainer' },
+        el('p', {}, 'The p-value is the probability of observing a test statistic as extreme or more extreme as the one computed, assuming the null hypothesis is true.')
+      ));
+    }
+
+    const altEl = el('div', { class: 'prob-row' },
+      el('label', { class: 'prob-section-label' }, 'Alternative Hypothesis'),
+      el('div', { class: 'prob-toggle-group' },
+        ...[['two-sided', 'Two-Sided'], ['left', 'Left-Tailed'], ['right', 'Right-Tailed']].map(([val, lbl]) => {
+          const btn = el('button', {
+            class: `prob-toggle-btn${state.alternative === val ? ' active' : ''}`,
+            onclick: () => {
+              state.alternative = val;
+              altEl.querySelectorAll('.prob-toggle-btn').forEach((b, i) => b.classList.toggle('active', ['two-sided','left','right'][i] === val));
+              calc();
+            }
+          }, lbl);
+          return btn;
+        })
+      )
+    );
+
+    function calc() {
+      resultEl.innerHTML = '';
+      vizEl.innerHTML = '';
+      const r = ProbabilityCalc.pValueFromZ({ z: state.z, alternative: state.alternative });
+      if (r.error) { resultEl.appendChild(el('div', { class: 'prob-error' }, '⚠ ' + r.error)); return; }
+
+      const card = el('div', { class: 'prob-result-card' });
+      card.appendChild(el('div', { class: 'prob-result-row' },
+        el('span', { class: 'prob-result-label' }, 'Z'),
+        el('span', { class: 'prob-result-value prob-result-z' }, r.z.toFixed(6))
+      ));
+      card.appendChild(el('div', { class: 'prob-result-row' },
+        el('span', { class: 'prob-result-label' }, 'p-value'),
+        el('span', { class: `prob-result-value ${r.pValue < 0.05 ? 'prob-sig' : 'prob-ns'}` }, r.pValue.toFixed(7))
+      ));
+      const sigText = r.pValue < 0.001 ? '*** Significant at p < .001' : r.pValue < 0.01 ? '** Significant at p < .01' : r.pValue < 0.05 ? '* Significant at p < .05' : 'Not significant at α = .05';
+      card.appendChild(el('div', { class: 'prob-result-row prob-result-secondary' },
+        el('span', { class: r.pValue < 0.05 ? 'prob-sig' : 'prob-ns' }, sigText)
+      ));
+      card.appendChild(el('div', { class: 'prob-result-method' }, `Alternative: ${r.alternative}`));
+      resultEl.appendChild(card);
+
+      // Visualization
+      const vizResult = ProbabilityCalc.calculateNormal({
+        mode: 'z', z: state.z,
+        tailType: r.alternative === 'two-sided' ? 'two' : r.alternative === 'left' ? 'left' : 'right',
+        method: 'exact'
+      });
+      if (!vizResult.error) renderVisualization(vizEl, vizResult);
+    }
+
+    container.appendChild(altEl);
+    container.appendChild(el('div', { class: 'prob-inputs-area' },
+      el('div', { class: 'prob-field' },
+        el('label', { class: 'prob-label' }, 'Z Statistic'),
+        el('input', { type: 'text', class: 'form-control prob-input', value: state.z,
+          oninput: e => { state.z = e.target.value; },
+          onkeydown: e => { if (e.key === 'Enter') calc(); }
+        })
+      )
+    ));
+    container.appendChild(el('button', { class: 'btn btn-primary prob-calc-btn', onclick: calc }, '⚡ Calculate p-value'));
+    container.appendChild(vizEl);
+    container.appendChild(resultEl);
+
+    if (prefillZ != null) setTimeout(calc, 50);
+  }
+
+  /* ── Tab: Examples ── */
+  function renderExamplesTab(container) {
+    const examples = [
+      {
+        title: 'Example 1: Z = 1.96',
+        desc: 'P(Z ≤ 1.96) — Classic confidence interval boundary',
+        calc: { mode: 'z', tailType: 'left', z: 1.96, method: 'exact' },
+        expected: 'P(Z ≤ 1.96) ≈ 0.9750 (97.50%)'
+      },
+      {
+        title: 'Example 2: Raw Score — IQ',
+        desc: 'X = 130, μ = 100, σ = 20 → Z = 1.50',
+        calc: { mode: 'raw', tailType: 'left', x: 130, mean: 100, sd: 20, method: 'exact' },
+        expected: 'P(X ≤ 130) ≈ 0.9332 (93.32%)'
+      },
+      {
+        title: 'Example 3: Negative Z',
+        desc: 'Z = −1.96, left tail',
+        calc: { mode: 'z', tailType: 'left', z: -1.96, method: 'exact' },
+        expected: 'P(Z ≤ −1.96) ≈ 0.0250 (2.50%)'
+      },
+      {
+        title: 'Example 4: Two-Tailed Test',
+        desc: 'Z = 1.96, two-tailed significance level',
+        calc: { mode: 'z', tailType: 'two', z: 1.96, method: 'exact' },
+        expected: 'P(|Z| ≥ 1.96) ≈ 0.0500 (5.00%)'
+      },
+      {
+        title: 'Example 5: Z = 0 (Mean)',
+        desc: 'Z = 0 is at the mean of the standard normal distribution',
+        calc: { mode: 'z', tailType: 'left', z: 0, method: 'exact' },
+        expected: 'P(Z ≤ 0) = 0.5000 (50.00%)'
+      },
+      {
+        title: 'Example 6: Between',
+        desc: 'P(−1.96 < Z < 1.96) — Middle 95%',
+        calc: { mode: 'z', tailType: 'between', z1: -1.96, z2: 1.96, method: 'exact' },
+        expected: 'P(−1.96 < Z < 1.96) ≈ 0.9500 (95.00%)'
+      },
+    ];
+
+    const grid = el('div', { class: 'prob-examples-grid' });
+    examples.forEach(ex => {
+      const card = el('div', { class: 'prob-example-card' },
+        el('div', { class: 'prob-example-title' }, ex.title),
+        el('div', { class: 'prob-example-desc' }, ex.desc),
+        el('div', { class: 'prob-example-expected' }, '✓ Expected: ' + ex.expected)
+      );
+      const runBtn = el('button', { class: 'btn btn-sm btn-primary', onclick: () => {
+        // Calculate and show result inline
+        const r = ProbabilityCalc.calculateNormal(ex.calc);
+        const res = card.querySelector('.prob-example-result');
+        if (res) res.remove();
+        if (r.error) { card.appendChild(el('div', { class: 'prob-error' }, r.error)); return; }
+        const resEl = el('div', { class: 'prob-example-result' },
+          el('div', {}, `P = ${r.probability.toFixed(7)} (${r.percentage.toFixed(4)}%)`),
+          el('div', { class: 'muted', style: { fontSize: '11px' } }, `Table: ${r.tableValue != null ? r.tableValue.toFixed(4) : '—'}`)
+        );
+        card.appendChild(resEl);
+      }}, 'Run Example');
+      card.appendChild(runBtn);
+      grid.appendChild(card);
+    });
+    container.appendChild(el('h3', { class: 'prob-examples-title' }, 'Built-in Examples'));
+    container.appendChild(grid);
+  }
+
+  /* ── Export result to Output Viewer ── */
+  function exportToOutput(result) {
+    const lines = [];
+    lines.push('PROBABILITY CALCULATOR — Normal Distribution');
+    lines.push('─'.repeat(50));
+    if (result.mode === 'raw') {
+      if (result.type !== 'between') {
+        lines.push(`X = ${result.x}, μ = ${result.mean}, σ = ${result.sd}`);
+      } else {
+        lines.push(`X₁ = ${result.x1}, X₂ = ${result.x2}, μ = ${result.mean}, σ = ${result.sd}`);
+      }
+    }
+    if (result.type === 'between') {
+      lines.push(`Z₁ = ${result.z1.toFixed(6)}, Z₂ = ${result.z2.toFixed(6)}`);
+    } else {
+      lines.push(`Z = ${result.z.toFixed(6)}`);
+    }
+    const tailLabel = { left: 'Left Tail P(Z ≤ z)', right: 'Right Tail P(Z > z)', between: 'Between P(z₁ < Z < z₂)', two: 'Two-Tailed P(|Z| ≥ |z|)' }[result.type];
+    lines.push(`${tailLabel}: ${result.probability.toFixed(7)} (${result.percentage.toFixed(4)}%)`);
+    if (result.tableValue != null) lines.push(`Z-Table Value (4 dp): ${result.tableValue.toFixed(4)}`);
+    lines.push(`Method: ${result.method === 'exact' ? 'Exact calculation (normCdf)' : 'Z-Table lookup'}`);
+
+    const htmlOutput = `
+      <div class="output-section">
+        <h3 class="output-title">Probability Calculator — Normal Distribution</h3>
+        <table class="pivot-table">
+          <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+          <tbody>
+            ${result.type !== 'between' ? `<tr><td>Z-Score</td><td>${result.z.toFixed(6)}</td></tr>` : `<tr><td>Z₁</td><td>${result.z1.toFixed(6)}</td></tr><tr><td>Z₂</td><td>${result.z2.toFixed(6)}</td></tr>`}
+            ${result.mode === 'raw' ? `<tr><td>μ (mean)</td><td>${result.mean}</td></tr><tr><td>σ (SD)</td><td>${result.sd}</td></tr>` : ''}
+            <tr><td>${tailLabel}</td><td><strong>${result.probability.toFixed(7)}</strong></td></tr>
+            <tr><td>Percentage</td><td>${result.percentage.toFixed(4)}%</td></tr>
+            ${result.tableValue != null ? `<tr><td>Table Value</td><td>${result.tableValue.toFixed(4)}</td></tr>` : ''}
+            <tr><td>Method</td><td>${result.method}</td></tr>
+          </tbody>
+        </table>
+      </div>`;
+
+    if (typeof Output !== 'undefined') {
+      Output.addResult('probability_calculator', {
+        status: 'complete',
+        result: { html: htmlOutput, text: lines.join('\n'), data: result },
+        warnings: []
+      }, { distribution: 'normal' });
+      if (typeof App !== 'undefined') App.navigate('output');
+      notify('Added to Output', 'success');
+    }
+  }
+
+  return { open };
+})();
+
+/* ══════════════════════════════════════════════════════════════════
    SECTION 10: OUTPUT VIEWER
    ══════════════════════════════════════════════════════════════════ */
 
@@ -3922,7 +7704,8 @@ const Output = (() => {
       nonparametric_wilcoxon:'Wilcoxon Signed-Rank Test', wilcoxon:'Wilcoxon Signed-Rank Test',
       nonparametric_kruskalwallis:'Kruskal-Wallis Test', kruskal_wallis:'Kruskal-Wallis Test',
       nonparametric_friedman:'Friedman Test', friedman:'Friedman Test',
-      kaplan_meier:'Kaplan-Meier Survival', kmeans:'K-Means Cluster Analysis'
+      kaplan_meier:'Kaplan-Meier Survival', kmeans:'K-Means Cluster Analysis',
+      probability_calculator:'Probability Calculator (Normal)',
     };
     return map[procedure]||procedure;
   }
@@ -3951,6 +7734,9 @@ const Output = (() => {
     toolbar.appendChild(el('button',{class:'btn btn-sm',onclick:()=>exportHTML()},'📄 Export HTML'));
     toolbar.appendChild(el('button',{class:'btn btn-sm',onclick:()=>exportPDF()},'📋 Export PDF'));
     toolbar.appendChild(el('button',{class:'btn btn-sm',onclick:()=>exportXLSX()},'📊 Export XLSX'));
+    toolbar.appendChild(el('button',{class:'btn btn-sm',onclick:()=>{
+      if (typeof ChartExportManager !== 'undefined') ChartExportManager.downloadAll();
+    }},'🖼 Download All Charts'));
     _container.appendChild(toolbar);
 
     // Tree + content split — flex:1 so it fills remaining height
@@ -4029,7 +7815,8 @@ const Output = (() => {
       nonparametric_kruskalwallis: renderNonpar, kruskal_wallis: renderNonpar,
       nonparametric_friedman: renderNonpar,     friedman: renderNonpar,
       kaplan_meier: renderKaplanMeier,
-      kmeans: renderKMeans
+      kmeans: renderKMeans,
+      probability_calculator: renderProbabilityOutput,
     };
     const renderer=renderers[procedure];
     if(renderer) renderer(container, result.result, params, entry.id);
@@ -4293,6 +8080,13 @@ const Output = (() => {
       container.appendChild(section('Effect Size', 'effect-size'));
       container.appendChild(pivotTable(["Cohen's d"], [[fmt(result.cohens_d, 3)]]));
     }
+    // [Explain Z] — for one-sample t, t ≈ Z for large n
+    if (result.t != null) {
+      container.appendChild(el('button', { class: 'btn btn-sm explain-z-btn',
+        title: 'Open Probability Calculator with this t-value (approximates Z for large n)',
+        onclick: () => ProbabilityCalcUI.open(parseFloat(fmt(result.t, 4)))
+      }, '📐 Explain Z (t = ' + fmt(result.t, 4) + ')'));
+    }
   }
 
   /* ── Independent T-Test renderer — engine: result.{variable,grouping_variable,group1,group2,
@@ -4332,6 +8126,14 @@ const Output = (() => {
     if (result.cohens_d != null) {
       container.appendChild(section('Effect Size', 'effect-size'));
       container.appendChild(pivotTable(["Cohen's d"], [[fmt(result.cohens_d, 3)]]));
+    }
+    // [Explain Z] button
+    const eq2 = result.equal_variance || {};
+    if (eq2.t != null) {
+      container.appendChild(el('button', { class: 'btn btn-sm explain-z-btn',
+        title: 'Open Probability Calculator with this t-value',
+        onclick: () => ProbabilityCalcUI.open(parseFloat(fmt(eq2.t, 4)))
+      }, '📐 Explain Z (t = ' + fmt(eq2.t, 4) + ')'));
     }
   }
 
@@ -4736,6 +8538,38 @@ const Output = (() => {
     }
   }
 
+  function renderProbabilityOutput(container, result) {
+    if (!result) return;
+    // If result has HTML, render it directly
+    if (result.html) {
+      container.insertAdjacentHTML('beforeend', result.html);
+      return;
+    }
+    // Fallback: render from data object
+    const data = result.data || result;
+    container.appendChild(section('Normal Distribution — Probability Calculator'));
+    const rows = [];
+    if (data.type === 'between') {
+      rows.push(['Z₁', data.z1 != null ? data.z1.toFixed(6) : '—']);
+      rows.push(['Z₂', data.z2 != null ? data.z2.toFixed(6) : '—']);
+    } else {
+      rows.push(['Z-Score', data.z != null ? data.z.toFixed(6) : '—']);
+    }
+    if (data.mode === 'raw') {
+      rows.push(['Mean (μ)', data.mean]);
+      rows.push(['SD (σ)', data.sd]);
+    }
+    const tailLabel = { left: 'P(Z ≤ z)', right: 'P(Z > z)', between: 'P(z₁ < Z < z₂)', two: 'P(|Z| ≥ |z|)' }[data.type] || data.type;
+    rows.push([tailLabel, data.probability != null ? data.probability.toFixed(7) : '—']);
+    rows.push(['Percentage', data.percentage != null ? data.percentage.toFixed(4) + '%' : '—']);
+    if (data.tableValue != null) rows.push(['Z-Table (4 dp)', data.tableValue.toFixed(4)]);
+    rows.push(['Method', data.method || '—']);
+    container.appendChild(pivotTable(['Parameter', 'Value'], rows));
+    // Re-open calculator button
+    container.appendChild(el('button', { class: 'btn btn-sm btn-primary', style: { marginTop: '8px' },
+      onclick: () => ProbabilityCalcUI.open(data.z) }, '📐 Open in Calculator'));
+  }
+
   function clearAll() { if(confirm('Clear all output?')){ _outputs=[]; Project.markDirty(); render(); } }
 
   function exportXLSX() {
@@ -4795,6 +8629,265 @@ const Output = (() => {
   function setOutputs(arr) { _outputs=arr||[]; render(); }
 
   return { init, addResult, render, getOutputs, setOutputs, clearAll, exportXLSX };
+})();
+
+/* ══════════════════════════════════════════════════════════════════
+   SECTION 10B: CHART EXPORT MANAGER
+   ══════════════════════════════════════════════════════════════════ */
+
+const ChartExportManager = (() => {
+  /* Registry: id → { id, title, chartType, instance, sourceModule, createdAt, metadata } */
+  const _registry = new Map();
+
+  function register(entry) {
+    if (!entry || !entry.id) return;
+    _registry.set(entry.id, { createdAt: new Date().toISOString(), ...entry });
+  }
+
+  function unregister(id) { _registry.delete(id); }
+  function get(id) { return _registry.get(id) || null; }
+  function getAll() { return [..._registry.values()]; }
+
+  /* ── i18n helper ── */
+  function _t(en, id) {
+    return (typeof I18N !== 'undefined' && I18N.getLang() === 'id') ? id : en;
+  }
+
+  /* ── filename helper ── */
+  function _filename(chartType, ext) {
+    const ts = Date.now();
+    return `sociostat_${(chartType || 'chart').replace(/[^a-z0-9]/gi, '_')}_${ts}.${ext}`;
+  }
+
+  /* ── PNG export (ECharts canvas OR generic element via html2canvas fallback) ── */
+  function downloadPNG(chartId) {
+    const entry = _registry.get(chartId);
+    if (!entry) { notify('Chart not found: ' + chartId, 'error'); return; }
+
+    // ECharts instance
+    const inst = entry.instance;
+    if (inst && typeof inst.getDataURL === 'function') {
+      try {
+        const url = inst.getDataURL({ type: 'png', pixelRatio: 2, backgroundColor: '#ffffff' });
+        _triggerDownload(url, _filename(entry.chartType, 'png'));
+        return;
+      } catch(e) { notify('PNG export failed: ' + e.message, 'error'); return; }
+    }
+
+    // SVG element fallback (used by StudentTUI)
+    const svgEl = entry.svgElement || document.getElementById(chartId);
+    if (svgEl && svgEl.tagName === 'svg') {
+      _svgToPNG(svgEl, _filename(entry.chartType, 'png'));
+      return;
+    }
+
+    notify(_t('PNG export: no chart instance found.', 'Ekspor PNG: instance chart tidak ditemukan.'), 'error');
+  }
+
+  /* ── SVG export ── */
+  function downloadSVG(chartId) {
+    const entry = _registry.get(chartId);
+    if (!entry) { notify('Chart not found: ' + chartId, 'error'); return; }
+
+    // ECharts SVG renderer
+    const inst = entry.instance;
+    if (inst && typeof inst.getDataURL === 'function') {
+      // ECharts only supports PNG via getDataURL when using canvas renderer
+      // For SVG export from canvas: disable and show message
+      const dom = inst.getDom ? inst.getDom() : null;
+      notify(_t(
+        'SVG export is not supported for this chart type (canvas renderer). Use PNG instead.',
+        'Ekspor SVG tidak tersedia untuk jenis chart ini. Gunakan PNG.'
+      ), 'warning', 4000);
+      return;
+    }
+
+    // Native SVG element
+    const svgEl = entry.svgElement || document.getElementById(chartId);
+    if (svgEl && svgEl.tagName === 'svg') {
+      try {
+        const serial = new XMLSerializer().serializeToString(svgEl);
+        const blob = new Blob([serial], { type: 'image/svg+xml' });
+        _triggerDownload(URL.createObjectURL(blob), _filename(entry.chartType, 'svg'));
+        return;
+      } catch(e) { notify('SVG export failed: ' + e.message, 'error'); return; }
+    }
+
+    notify(_t('SVG export is not supported by this chart type.', 'Ekspor SVG tidak tersedia.'), 'warning');
+  }
+
+  /* ── PDF export ── */
+  function downloadPDF(chartId) {
+    const entry = _registry.get(chartId);
+    if (!entry) { notify('Chart not found: ' + chartId, 'error'); return; }
+
+    const JsPDF = (typeof window !== 'undefined') && (window.jspdf?.jsPDF || window.jsPDF);
+    if (!JsPDF) {
+      notify(_t(
+        'PDF export unavailable — jsPDF library not loaded. PNG is available.',
+        'PDF tidak tersedia — library jsPDF belum dimuat. Gunakan PNG.'
+      ), 'warning', 5000);
+      return;
+    }
+
+    // Get image data first, then build PDF
+    function buildPDF(imgData, imgW, imgH) {
+      try {
+        const pageW = imgW + 80, pageH = imgH + 120;
+        const doc = new JsPDF({ orientation: imgW > imgH ? 'landscape' : 'portrait', unit: 'pt', format: [pageW, pageH] });
+        doc.setFontSize(14); doc.setFont('helvetica', 'bold');
+        const title = entry.title || "SOCIOSTAT Chart";
+        doc.text('SOCIOSTAT — ' + title, pageW / 2, 28, { align: 'center' });
+        if (entry.metadata) {
+          doc.setFontSize(10); doc.setFont('helvetica', 'normal');
+          const meta = Object.entries(entry.metadata).map(([k, v]) => `${k} = ${v}`).join('   ');
+          doc.text(meta, pageW / 2, 44, { align: 'center' });
+        }
+        doc.addImage(imgData, 'PNG', 40, 60, imgW, imgH);
+        doc.save(_filename(entry.chartType, 'pdf'));
+      } catch(e) { notify('PDF export failed: ' + e.message, 'error'); }
+    }
+
+    const inst = entry.instance;
+    if (inst && typeof inst.getDataURL === 'function') {
+      try {
+        const url = inst.getDataURL({ type: 'png', pixelRatio: 2, backgroundColor: '#ffffff' });
+        const img = new Image(); img.onload = () => buildPDF(url, img.width / 2, img.height / 2);
+        img.src = url;
+        return;
+      } catch(e) { notify('PDF export failed: ' + e.message, 'error'); return; }
+    }
+
+    const svgEl = entry.svgElement || document.getElementById(chartId);
+    if (svgEl && svgEl.tagName === 'svg') {
+      const W = parseInt(svgEl.getAttribute('width') || 560);
+      const H = parseInt(svgEl.getAttribute('height') || 320);
+      _svgToPNGData(svgEl, W * 2, H * 2, dataUrl => buildPDF(dataUrl, W, H));
+      return;
+    }
+
+    notify(_t('PDF export: no chart data available.', 'PDF: data chart tidak tersedia.'), 'error');
+  }
+
+  /* ── Copy to clipboard ── */
+  function copy(chartId) {
+    const entry = _registry.get(chartId);
+    if (!entry) return;
+    const inst = entry.instance;
+    if (inst && typeof inst.getDataURL === 'function') {
+      try {
+        const url = inst.getDataURL({ type: 'png', pixelRatio: 2, backgroundColor: '#ffffff' });
+        _clipboardFromDataURL(url);
+        return;
+      } catch(e) {}
+    }
+    notify(_t('Copy not supported for this chart.', 'Salin tidak tersedia untuk chart ini.'), 'warning');
+  }
+
+  /* ── Add to Output ── */
+  function addToOutput(chartId) {
+    const entry = _registry.get(chartId);
+    if (!entry) { notify('Chart not found.', 'error'); return; }
+    if (typeof Output === 'undefined') return;
+
+    const inst = entry.instance;
+    let imgData = '';
+    if (inst && typeof inst.getDataURL === 'function') {
+      try { imgData = inst.getDataURL({ type: 'png', pixelRatio: 1.5, backgroundColor: '#ffffff' }); } catch(e) {}
+    }
+
+    const metaHtml = entry.metadata
+      ? Object.entries(entry.metadata).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')
+      : '';
+    const imgHtml = imgData ? `<img src="${imgData}" style="max-width:100%;height:auto;border-radius:6px;display:block;margin:10px 0;" alt="${entry.title}">` : '';
+
+    const htmlOutput = `
+      <div class="output-section">
+        <h3 class="output-title">${entry.title || 'Chart'}</h3>
+        ${imgHtml}
+        ${metaHtml ? `<table class="pivot-table"><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>${metaHtml}</tbody></table>` : ''}
+      </div>`;
+
+    Output.addResult(entry.sourceModule || 'chart', {
+      status: 'complete',
+      result: { html: htmlOutput, text: entry.title || 'Chart', data: entry.metadata },
+      warnings: []
+    }, { chartType: entry.chartType });
+
+    if (typeof App !== 'undefined') App.navigate('output');
+    notify(_t('Chart added to Output', 'Chart ditambahkan ke Output'), 'success');
+  }
+
+  /* ── Build a universal toolbar DOM element ── */
+  function buildToolbar(chartId) {
+    const bar = el('div', { class: 'cem-toolbar' });
+    bar.appendChild(el('span', { class: 'cem-toolbar-label' }, _t('Download:', 'Unduh:')));
+
+    function btn(label, action, classes) {
+      return el('button', { class: 'cem-btn ' + (classes || ''), onclick: action }, label);
+    }
+
+    bar.appendChild(btn(_t('PNG', 'PNG'), () => downloadPNG(chartId)));
+    bar.appendChild(btn(_t('SVG', 'SVG'), () => downloadSVG(chartId)));
+    bar.appendChild(btn(_t('PDF', 'PDF'), () => downloadPDF(chartId)));
+    bar.appendChild(btn('📋 ' + _t('Add to Output', 'Tambahkan ke Output'), () => addToOutput(chartId), 'cem-btn-primary'));
+    return bar;
+  }
+
+  /* ── Batch: download all registered charts as PNG ── */
+  function downloadAll() {
+    const all = getAll();
+    if (!all.length) { notify(_t('No charts to download.', 'Tidak ada chart untuk diunduh.'), 'warning'); return; }
+    all.forEach((entry, i) => {
+      setTimeout(() => downloadPNG(entry.id), i * 400); // stagger to avoid browser blocking
+    });
+    notify(_t(`Downloading ${all.length} chart(s)…`, `Mengunduh ${all.length} chart…`), 'info');
+  }
+
+  /* ── Internal helpers ── */
+  function _triggerDownload(url, filename) {
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+  }
+
+  function _svgToPNG(svgEl, filename) {
+    _svgToPNGData(svgEl,
+      parseInt(svgEl.getAttribute('width') || 560) * 2,
+      parseInt(svgEl.getAttribute('height') || 320) * 2,
+      dataUrl => _triggerDownload(dataUrl, filename));
+  }
+
+  function _svgToPNGData(svgEl, W, H, callback) {
+    try {
+      const serial = new XMLSerializer().serializeToString(svgEl);
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = W; canvas.height = H;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, W, H);
+        callback(canvas.toDataURL('image/png'));
+      };
+      img.onerror = () => notify('PNG rasterisation failed.', 'error');
+      img.src = URL.createObjectURL(new Blob([serial], { type: 'image/svg+xml' }));
+    } catch(e) { notify('PNG export failed: ' + e.message, 'error'); }
+  }
+
+  function _clipboardFromDataURL(dataUrl) {
+    fetch(dataUrl).then(r => r.blob()).then(blob => {
+      navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+        .then(() => notify(_t('Chart copied to clipboard.', 'Chart disalin ke clipboard.'), 'success'))
+        .catch(() => notify(_t('Clipboard copy failed.', 'Gagal menyalin.'), 'error'));
+    }).catch(() => notify(_t('Clipboard copy failed.', 'Gagal menyalin.'), 'error'));
+  }
+
+  return {
+    register, unregister, get, getAll,
+    downloadPNG, downloadSVG, downloadPDF, copy, addToOutput,
+    buildToolbar, downloadAll
+  };
 })();
 
 /* ══════════════════════════════════════════════════════════════════
@@ -4991,7 +9084,7 @@ const SyntaxEditor = (() => {
       el('button', { class: 'btn btn-primary btn-sm', onclick: () => runSyntax() }, '▶ Run'),
       el('button', { class: 'btn btn-sm', onclick: () => clearEditor() }, 'Clear'),
       el('button', { class: 'btn btn-sm', onclick: () => exportSyntax() }, 'Export .sps'),
-      el('span', { class: 'muted small', style: { marginLeft:'8px' } }, 'Supported: DESCRIPTIVES, FREQUENCIES, CORRELATIONS, T-TEST, ONEWAY, REGRESSION, RELIABILITY, CROSSTABS, COMPUTE, SORT CASES, SELECT IF')
+      el('span', { class: 'muted small', style: { marginLeft:'8px' } }, 'Supported: DESCRIPTIVES, FREQUENCIES, CORRELATIONS, T-TEST, ONEWAY, REGRESSION, RELIABILITY, CROSSTABS, COMPUTE, SORT CASES, SELECT IF, T_DISTRIBUTION, T_PROBABILITY, T_TEST_STAT')
     );
 
     const textarea = el('textarea', {
@@ -5024,142 +9117,296 @@ const SyntaxEditor = (() => {
     const syntax = _currentSyntax.trim();
     if (!syntax) { notify('No syntax to run', 'warning'); return; }
     const ds = AppState.get('activeDataset');
-    if (!ds) { notify('No dataset loaded', 'error'); return; }
 
-    // Parse simple syntax → dispatch to ProcedureRegistry
-    const result = parseSyntax(syntax, ds);
-    _history.push({ syntax, timestamp: new Date().toISOString(), result });
+    // Distribution commands (T_DISTRIBUTION / T_PROBABILITY / T_TEST_STAT) do not
+    // require a dataset — allow them to run even when no dataset is loaded.
+    const DATASET_FREE_CMDS = /^(T_DISTRIBUTION|T_PROBABILITY|T_TEST_STAT)\b/i;
+    if (!ds && !DATASET_FREE_CMDS.test(syntax.trim())) {
+      notify('No dataset loaded', 'error'); return;
+    }
+
+    // Parse → execute synchronously through ProcedureRegistry (no async gap)
+    const outcome = parseSyntax(syntax, ds);
+    _history.push({ syntax, timestamp: new Date().toISOString(), outcome });
     History.addEntry({ type: 'syntax', syntax, timestamp: new Date().toISOString() });
-    if (result.error) {
-      notify('Syntax error: ' + result.error, 'error');
+
+    if (outcome.parseError) {
+      notify('Syntax error: ' + outcome.parseError, 'error');
+    } else if (outcome.execError) {
+      notify('Execution error: ' + outcome.execError, 'error');
+    } else if (outcome.isTransform) {
+      // Transform / filter — already notified inside parseSyntax
     } else {
-      notify('Syntax executed successfully', 'success');
+      // Statistical procedure — result is already in Output
+      notify(outcome.procedureId + ' completed', 'success');
       App.navigate('output');
     }
     render();
   }
 
+  /**
+   * parseSyntax — Parses one SOCIOSTAT syntax command and executes it
+   * synchronously through ProcedureRegistry.runProcedure().
+   *
+   * GUI and Syntax now share the exact same execution path:
+   *   Parser → AnalysisSpec (params) → ProcedureRegistry.runProcedure() → Output.addResult()
+   *
+   * Returns:
+   *   { procedureId, result }          on successful statistical run
+   *   { parseError: string }           on parse failure
+   *   { execError: string }            on engine error
+   *   { isTransform: true }            for COMPUTE / SORT / SELECT IF (no Output entry)
+   */
   function parseSyntax(syntax, dataset) {
-    // Very basic syntax parser — supports DESCRIPTIVES, FREQUENCIES, CORRELATIONS,
-    // T-TEST, ONEWAY, REGRESSION, RELIABILITY, CROSSTABS
     const lines = syntax.split('\n').map(l => l.replace(/\*.*/, '').trim()).filter(Boolean);
+    if (!lines.length) return { parseError: 'Empty syntax.' };
     const cmd = lines[0].toUpperCase();
 
+    /* Helper: run a procedure through the registry, add to Output, return outcome */
+    function runProc(procedureId, params) {
+      const result = ProcedureRegistry.runProcedure(procedureId, dataset, params);
+      Output.addResult(procedureId, result, params);
+      History.addEntry({ type: 'analysis', procedure: procedureId, params, timestamp: new Date().toISOString() });
+      if (result.status === 'error') {
+        return { procedureId, execError: result.error?.message || 'Unknown engine error', result };
+      }
+      return { procedureId, result };
+    }
+
     try {
+      /* ── DESCRIPTIVES ── */
       if (cmd.startsWith('DESCRIPTIVES')) {
         const vars = extractVarList(lines, 'VARIABLES');
-        if (!vars.length) return { error: 'No variables specified for DESCRIPTIVES.' };
-        AnalysisDialogs.runAnalysis('descriptives', { variables: vars });
-        return { ok: true };
+        if (!vars.length) return { parseError: 'No variables specified for DESCRIPTIVES.' };
+        return runProc('descriptives', { variables: vars });
       }
+
+      /* ── FREQUENCIES ── */
       if (cmd.startsWith('FREQUENCIES')) {
         const vars = extractVarList(lines, 'VARIABLES');
-        if (!vars.length) return { error: 'No variables for FREQUENCIES.' };
-        AnalysisDialogs.runAnalysis('frequencies', { variables: vars });
-        return { ok: true };
+        if (!vars.length) return { parseError: 'No variables for FREQUENCIES.' };
+        return runProc('frequencies', { variables: vars });
       }
+
+      /* ── CORRELATIONS ── */
       if (cmd.startsWith('CORRELATIONS')) {
         const vars = extractVarList(lines, 'VARIABLES');
+        if (!vars.length) return { parseError: 'No variables for CORRELATIONS.' };
         const method = /SPEARMAN/i.test(syntax) ? 'spearman' : 'pearson';
-        AnalysisDialogs.runAnalysis('correlation', { variables: vars, method });
-        return { ok: true };
+        return runProc('correlation', { variables: vars, method });
       }
+
+      /* ── T-TEST ── */
       if (cmd.startsWith('T-TEST') || cmd.startsWith('TTEST')) {
         if (/\/TESTVAL/i.test(syntax)) {
           const vars = extractVarList(lines, 'VARIABLES');
-          const tv = parseFloat(syntax.match(/\/TESTVAL\s*=\s*([\d\.\-]+)/i)?.[1] || '0');
-          // Engine processes one variable at a time
-          vars.forEach(vn => AnalysisDialogs.runAnalysis('ttest_onesample', { variable: vn, test_value: tv }));
-        } else if (/\/PAIRS/i.test(syntax)) {
+          if (!vars.length) return { parseError: 'T-TEST /TESTVAL requires VARIABLES=.' };
+          const tv = parseFloat(syntax.match(/\/TESTVAL\s*=\s*([\d.\-]+)/i)?.[1] || '0');
+          // Run one per variable; last result determines overall outcome
+          let last;
+          vars.forEach(vn => { last = runProc('ttest_onesample', { variable: vn, test_value: tv }); });
+          return last || { parseError: 'T-TEST: no variables processed.' };
+        }
+        if (/\/PAIRS/i.test(syntax)) {
           const m = syntax.match(/\/PAIRS\s*=\s*(\w+)\s+WITH\s+(\w+)/i);
-          if (m) AnalysisDialogs.runAnalysis('ttest_paired', { variable1: m[1], variable2: m[2] });
-        } else {
-          const vars = extractVarList(lines, 'VARIABLES');
-          const grpM = syntax.match(/\/GROUPS\s*=\s*(\w+)\s*\(\s*([\d\.]+)\s+([\d\.]+)\s*\)/i);
-          if (grpM && vars[0]) AnalysisDialogs.runAnalysis('ttest_independent', {
+          if (!m) return { parseError: 'T-TEST /PAIRS syntax error. Use: /PAIRS=var1 WITH var2.' };
+          return runProc('ttest_paired', { variable1: m[1], variable2: m[2] });
+        }
+        // Independent-samples
+        const vars = extractVarList(lines, 'VARIABLES');
+        const grpM = syntax.match(/\/GROUPS\s*=\s*(\w+)\s*\(\s*([\d.]+)\s+([\d.]+)\s*\)/i);
+        if (grpM && vars[0]) {
+          return runProc('ttest_independent', {
             variable: vars[0], grouping_variable: grpM[1],
             group1: Number(grpM[2]), group2: Number(grpM[3])
           });
         }
-        return { ok: true };
+        return { parseError: 'T-TEST syntax error. Use /TESTVAL=, /PAIRS=, or VARIABLES= /GROUPS=grp(1 2).' };
       }
+
+      /* ── ONEWAY ── */
       if (cmd.startsWith('ONEWAY')) {
         const dvM = syntax.match(/ONEWAY\s+([\w\s]+)\s+BY\s+(\w+)/i);
-        if (dvM) {
-          const dvs = dvM[1].trim().split(/\s+/);
-          const fv = dvM[2];
-          const ph = /TUKEY/i.test(syntax) ? ['tukey'] : /BONFERRONI/i.test(syntax) ? ['bonferroni'] : [];
-          dvs.forEach(dv => AnalysisDialogs.runAnalysis('anova_oneway', { dependent: dv, factor: fv, post_hoc: ph }));
-          return { ok: true };
-        }
-        return { error: 'ONEWAY syntax error. Use: ONEWAY depvar BY factor.' };
+        if (!dvM) return { parseError: 'ONEWAY syntax error. Use: ONEWAY depvar BY factor.' };
+        const dvs = dvM[1].trim().split(/\s+/);
+        const fv  = dvM[2];
+        const ph  = /TUKEY/i.test(syntax) ? ['tukey'] : /BONFERRONI/i.test(syntax) ? ['bonferroni'] : [];
+        let last;
+        dvs.forEach(dv => { last = runProc('anova_oneway', { dependent: dv, factor: fv, post_hoc: ph }); });
+        return last || { parseError: 'ONEWAY: no dependent variables processed.' };
       }
+
+      /* ── REGRESSION ── */
       if (cmd.startsWith('REGRESSION')) {
         const depM = syntax.match(/\/DEPENDENT\s+(\w+)/i);
         const indM = syntax.match(/METHOD\s*=\s*ENTER\s+([\w\s]+)/i);
-        if (depM && indM) {
-          AnalysisDialogs.runAnalysis('linear_regression', {
-            dependent: depM[1],
-            independent: indM[1].trim().split(/\s+/).filter(Boolean)
-          });
-          return { ok: true };
-        }
-        return { error: 'REGRESSION syntax error. Use: REGRESSION /DEPENDENT y /METHOD=ENTER x1 x2.' };
+        if (!depM || !indM) return { parseError: 'REGRESSION syntax error. Use: REGRESSION /DEPENDENT y /METHOD=ENTER x1 x2.' };
+        return runProc('linear_regression', {
+          dependent: depM[1],
+          independent: indM[1].trim().split(/\s+/).filter(Boolean)
+        });
       }
+
+      /* ── RELIABILITY ── */
       if (cmd.startsWith('RELIABILITY')) {
         const vars = extractVarList(lines, 'VARIABLES');
-        if (vars.length < 2) return { error: 'RELIABILITY requires at least 2 variables.' };
-        AnalysisDialogs.runAnalysis('reliability', { items: vars });
-        return { ok: true };
+        if (vars.length < 2) return { parseError: 'RELIABILITY requires at least 2 variables.' };
+        return runProc('reliability', { items: vars });
       }
+
+      /* ── CROSSTABS ── */
       if (cmd.startsWith('CROSSTABS')) {
         const m = syntax.match(/\/TABLES\s*=\s*(\w+)\s+BY\s+(\w+)/i);
-        if (m) {
-          AnalysisDialogs.runAnalysis('crosstabs', {
-            row_variable: m[1], column_variable: m[2],
-            statistics: { chi_square: true, phi_cramer: true }
-          });
-          return { ok: true };
-        }
-        return { error: 'CROSSTABS syntax error. Use: CROSSTABS /TABLES=row BY col.' };
+        if (!m) return { parseError: 'CROSSTABS syntax error. Use: CROSSTABS /TABLES=row BY col.' };
+        return runProc('crosstabs', {
+          row_variable: m[1], column_variable: m[2],
+          statistics: { chi_square: true, phi_cramer: true }
+        });
       }
+
+      /* ── COMPUTE (transform — no Output entry) ── */
       if (cmd.startsWith('COMPUTE')) {
         const m = syntax.match(/COMPUTE\s+(\w+)\s*=\s*(.+)\./i);
-        if (m && AppState.get('activeDataset')) {
-          Transform.computeVariable(AppState.get('activeDataset'), m[1].trim(), m[2].trim());
-          notify(`Computed variable: ${m[1]}`, 'success');
-          Project.markDirty();
-          return { ok: true };
-        }
-        return { error: 'COMPUTE syntax error. Use: COMPUTE newvar = expression.' };
+        if (!m) return { parseError: 'COMPUTE syntax error. Use: COMPUTE newvar = expression.' };
+        Transform.computeVariable(dataset, m[1].trim(), m[2].trim());
+        notify('Computed variable: ' + m[1], 'success');
+        Project.markDirty();
+        return { isTransform: true };
       }
+
+      /* ── SORT CASES (transform) ── */
       if (cmd.startsWith('SORT CASES')) {
-        const m = syntax.match(/BY\s+([\w\s\(\)ADSC]+)\./i);
-        if (m && AppState.get('activeDataset')) {
-          const parts = m[1].trim().split(/\s+/);
-          const keys = [];
-          for (let i = 0; i < parts.length; i++) {
-            if (parts[i + 1] === '(D)') { keys.push({ variable: parts[i], direction: 'desc' }); i++; }
-            else if (parts[i] !== '(A)') keys.push({ variable: parts[i], direction: 'asc' });
-          }
-          Transform.sortCases(AppState.get('activeDataset'), keys);
-          Project.markDirty();
-          return { ok: true };
+        const m = syntax.match(/BY\s+([\w\s()\-ADSC]+)\./i);
+        if (!m) return { parseError: 'SORT CASES syntax error. Use: SORT CASES BY var1 (A) var2 (D).' };
+        const parts = m[1].trim().split(/\s+/);
+        const keys = [];
+        for (let i = 0; i < parts.length; i++) {
+          if (parts[i + 1] === '(D)') { keys.push({ variable: parts[i], direction: 'desc' }); i++; }
+          else if (parts[i] !== '(A)') keys.push({ variable: parts[i], direction: 'asc' });
         }
+        Transform.sortCases(dataset, keys);
+        notify('Cases sorted.', 'success');
+        Project.markDirty();
+        return { isTransform: true };
       }
+
+      /* ── SELECT IF / FILTER (transform) ── */
       if (cmd.startsWith('SELECT IF') || cmd.startsWith('FILTER')) {
         const m = syntax.match(/(?:SELECT IF|FILTER)\s+(.+)\./i);
-        if (m && AppState.get('activeDataset')) {
-          Transform.selectCases(AppState.get('activeDataset'), m[1].trim());
-          notify(`Filter applied: ${m[1]}`, 'success');
-          Project.markDirty();
-          App.updateStatusBar();
-          return { ok: true };
-        }
+        if (!m) return { parseError: 'SELECT IF syntax error. Use: SELECT IF expression.' };
+        Transform.selectCases(dataset, m[1].trim());
+        notify('Filter applied: ' + m[1], 'success');
+        Project.markDirty();
+        App.updateStatusBar();
+        return { isTransform: true };
       }
-      return { error: `Unrecognized command: ${lines[0].split(/\s/)[0]}` };
+
+      /* ── T_DISTRIBUTION — Find Critical t ── */
+      if (cmd.startsWith('T_DISTRIBUTION')) {
+        const dfM   = lines.join(' ').match(/\/DF\s*=\s*([\d.]+)/i);
+        const alpM  = lines.join(' ').match(/\/ALPHA\s*=\s*([\d.]+)/i);
+        const tailM = lines.join(' ').match(/\/TAIL\s*=\s*(\w+)/i);
+        if (!dfM || !alpM) return { parseError: 'T_DISTRIBUTION requires /DF= and /ALPHA=.' };
+        const tailRaw = (tailM?.[1] || 'TWO').toUpperCase();
+        const tail = tailRaw === 'TWO' ? 'two-tailed' : tailRaw === 'RIGHT' ? 'right' : 'left';
+        const r = StudentTCalc.criticalT({ df: Number(dfM[1]), alpha: Number(alpM[1]), tail });
+        if (r.error) return { parseError: 'T_DISTRIBUTION: ' + r.error };
+        const dispVal = r.tail === 'two-tailed'
+          ? `±${r.criticalValueAbs.toFixed(6)}` : r.criticalValue.toFixed(6);
+        const htmlOutput = `<div class="output-section">
+          <h3 class="output-title">Student's t Distribution — Critical t</h3>
+          <table class="pivot-table">
+            <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td>df</td><td><strong>${r.df}</strong></td></tr>
+              <tr><td>α</td><td><strong>${r.alpha}</strong></td></tr>
+              <tr><td>Tail</td><td><strong>${r.tail}</strong></td></tr>
+              <tr><td>Table α</td><td><strong>${r.tableAlpha}</strong></td></tr>
+              <tr><td>t critical</td><td><strong>${dispVal}</strong></td></tr>
+              ${r.tableAvailable ? `<tr><td>Reference table value</td><td><strong>${r.tableValue}</strong></td></tr>` : ''}
+              <tr><td>Method</td><td>${r.method}</td></tr>
+            </tbody>
+          </table>
+        </div>`;
+        Output.addResult('student_t', {
+          status: 'complete',
+          result: { html: htmlOutput, text: `t critical = ${dispVal}  df=${r.df}  α=${r.alpha}  ${r.tail}`, data: r },
+          warnings: []
+        }, { distribution: 'student_t' });
+        return { procedureId: 'student_t', result: { status: 'complete', data: r } };
+      }
+
+      /* ── T_PROBABILITY — Calculate probability / p-value ── */
+      if (cmd.startsWith('T_PROBABILITY')) {
+        const dfM   = lines.join(' ').match(/\/DF\s*=\s*([\d.]+)/i);
+        const tM    = lines.join(' ').match(/\/T\s*=\s*([-\d.]+)/i);
+        const tailM = lines.join(' ').match(/\/TAIL\s*=\s*(\w+)/i);
+        if (!dfM || !tM) return { parseError: 'T_PROBABILITY requires /DF= and /T=.' };
+        const tailRaw = (tailM?.[1] || 'TWO').toUpperCase();
+        const tail = tailRaw === 'TWO' ? 'two-tailed' : tailRaw === 'RIGHT' ? 'right' : 'left';
+        const r = StudentTCalc.probability({ df: Number(dfM[1]), t: Number(tM[1]), tail });
+        if (r.error) return { parseError: 'T_PROBABILITY: ' + r.error };
+        const htmlOutput = `<div class="output-section">
+          <h3 class="output-title">Student's t Distribution — Probability</h3>
+          <table class="pivot-table">
+            <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td>t</td><td><strong>${r.t.toFixed(6)}</strong></td></tr>
+              <tr><td>df</td><td><strong>${r.df}</strong></td></tr>
+              <tr><td>Tail</td><td><strong>${r.tail}</strong></td></tr>
+              <tr><td>P(T ≤ t)</td><td>${r.leftTail.toFixed(7)}</td></tr>
+              <tr><td>P(T ≥ t)</td><td>${r.rightTail.toFixed(7)}</td></tr>
+              <tr><td>p-value (${r.tail})</td><td><strong>${r.pValue.toFixed(7)}</strong></td></tr>
+            </tbody>
+          </table>
+        </div>`;
+        Output.addResult('student_t', {
+          status: 'complete',
+          result: { html: htmlOutput, text: `p-value = ${r.pValue.toFixed(7)}  t=${r.t}  df=${r.df}  ${r.tail}`, data: r },
+          warnings: []
+        }, { distribution: 'student_t' });
+        return { procedureId: 'student_t', result: { status: 'complete', data: r } };
+      }
+
+      /* ── T_TEST_STAT — Test a t statistic ── */
+      if (cmd.startsWith('T_TEST_STAT')) {
+        const tObsM = lines.join(' ').match(/\/T_OBSERVED\s*=\s*([-\d.]+)/i);
+        const dfM   = lines.join(' ').match(/\/DF\s*=\s*([\d.]+)/i);
+        const alpM  = lines.join(' ').match(/\/ALPHA\s*=\s*([\d.]+)/i);
+        const tailM = lines.join(' ').match(/\/TAIL\s*=\s*(\w+)/i);
+        if (!tObsM || !dfM || !alpM) return { parseError: 'T_TEST_STAT requires /T_OBSERVED=, /DF=, /ALPHA=.' };
+        const tailRaw = (tailM?.[1] || 'TWO').toUpperCase();
+        const tail = tailRaw === 'TWO' ? 'two-tailed' : tailRaw === 'RIGHT' ? 'right' : 'left';
+        const r = StudentTCalc.testStatistic({ t: Number(tObsM[1]), df: Number(dfM[1]), alpha: Number(alpM[1]), tail });
+        if (r.error) return { parseError: 'T_TEST_STAT: ' + r.error };
+        const critDisp = r.tail === 'two-tailed' ? `±${r.tCriticalAbs.toFixed(6)}` : r.tCritical.toFixed(6);
+        const htmlOutput = `<div class="output-section">
+          <h3 class="output-title">Student's t Distribution — Hypothesis Test</h3>
+          <table class="pivot-table">
+            <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td>t observed</td><td><strong>${r.tObserved.toFixed(6)}</strong></td></tr>
+              <tr><td>df</td><td><strong>${r.df}</strong></td></tr>
+              <tr><td>α</td><td><strong>${r.alpha}</strong></td></tr>
+              <tr><td>Tail</td><td><strong>${r.tail}</strong></td></tr>
+              <tr><td>t critical</td><td><strong>${critDisp}</strong></td></tr>
+              <tr><td>p-value</td><td><strong>${r.pValue.toFixed(7)}</strong></td></tr>
+              <tr><td>Decision</td><td><strong style="color:${r.reject?'#dc2626':'#15803d'}">${r.decision}</strong></td></tr>
+            </tbody>
+          </table>
+        </div>`;
+        Output.addResult('student_t', {
+          status: 'complete',
+          result: { html: htmlOutput, text: `Decision: ${r.decision}  t=${r.tObserved}  df=${r.df}  α=${r.alpha}  ${r.tail}`, data: r },
+          warnings: []
+        }, { distribution: 'student_t' });
+        return { procedureId: 'student_t', result: { status: 'complete', data: r } };
+      }
+
+      return { parseError: 'Unrecognized command: ' + lines[0].split(/\s/)[0] };
+
     } catch (e) {
-      return { error: e.message };
+      return { parseError: e.message };
     }
   }
 
@@ -5250,6 +9497,27 @@ const Project = (() => {
   async function openProject(projId) {
     const proj = await DB.loadProject(projId);
     if (!proj) { notify('Project not found', 'error'); return; }
+
+    // Migrate all datasets in the project that have schema version < 2
+    // (i.e., were created before the canonical key schema was enforced).
+    if (typeof DataIntegrity !== 'undefined' && Array.isArray(proj.datasets)) {
+      proj.datasets.forEach(ds => {
+        const needsMigration = !ds.metadata?.schemaVersion || ds.metadata.schemaVersion < 2;
+        if (needsMigration) {
+          const integrity = DataIntegrity.check(ds);
+          if (!integrity.ok) {
+            const mig = DataIntegrity.migrateSchema(ds);
+            if (mig.migrated) {
+              console.warn(`[Project] Migrated dataset "${ds.name}":`, mig.changes);
+              markDirty();
+            }
+          }
+          ds.metadata = ds.metadata || {};
+          ds.metadata.schemaVersion = 2;
+        }
+      });
+    }
+
     AppState.set('currentProject', proj);
     const ds = proj.datasets.find(d => d.id === proj.activeDatasetId) || proj.datasets[0] || null;
     AppState.set('activeDataset', ds);
@@ -5439,6 +9707,58 @@ const AIAssistant = (() => {
     }
     if (/jalankan.*deskript|run.*descript|statistik.*deskript|rata.?rata.*semua/.test(m)) return {action:'RUN_DESCRIPTIVES', params:{}};
     if (/jalankan.*korelasi|run.*correlat|hitung.*korelasi/.test(m)) return {action:'RUN_CORRELATION', params:{}};
+    // Student's t distribution — detect BEFORE generic probability to avoid false matches
+    // "t tabel" / "t kritis" / "critical t" / "cari t"
+    if (/t\s*tabel|t\s*kritis|critical\s*t|cari\s*t|find\s*critical\s*t|berapa\s*t\s*tabel|t\s*distribution|distribusi\s*t/.test(m)) {
+      const dfMatch = m.match(/df\s*[=:]?\s*(\d+)/);
+      const alphaMatch = m.match(/alpha\s*[=:]?\s*([\d.]+)|α\s*[=:]?\s*([\d.]+)|\b(0\.\d+|[\d]+)\s*persen\b|(\d+)\s*%/);
+      const tailMatch = /dua\s*sisi|two.?tailed|two\s*tail/.test(m) ? 'two-tailed' : /kiri|left/.test(m) ? 'left' : /kanan|right/.test(m) ? 'right' : 'two-tailed';
+      let alpha = null;
+      if (alphaMatch) {
+        const raw = alphaMatch[1] || alphaMatch[2] || alphaMatch[3] || alphaMatch[4];
+        if (raw) {
+          alpha = parseFloat(raw);
+          if (alpha > 1) alpha = alpha / 100; // e.g. "5 persen" → 0.05
+        }
+      }
+      return { action: 'STUDENT_T_CRITICAL', params: { df: dfMatch ? parseInt(dfMatch[1]) : null, alpha, tail: tailMatch } };
+    }
+    // "p value kalau t = ..." / "berapa p value t ..."
+    if (/p\s*value.*t\s*[=:]?\s*([-\d.]+)|hitung.*p.*t\s*[=:]?\s*([-\d.]+)|berapa.*p.*t\s*[=:]\s*([-\d.]+)/.test(m)) {
+      const tMatch = m.match(/t\s*[=:]?\s*([-\d.]+)/);
+      const dfMatch = m.match(/df\s*[=:]?\s*(\d+)/);
+      const tailMatch = /dua\s*sisi|two.?tailed/.test(m) ? 'two-tailed' : /kiri|left/.test(m) ? 'left' : /kanan|right/.test(m) ? 'right' : 'two-tailed';
+      return { action: 'STUDENT_T_PROBABILITY', params: {
+        t: tMatch ? parseFloat(tMatch[1]) : null,
+        df: dfMatch ? parseInt(dfMatch[1]) : null,
+        tail: tailMatch
+      }};
+    }
+    // "uji t ... df ... alpha ..." test mode
+    if (/uji\s*t|test\s*t\s*stat|t\s*stat.*test/.test(m)) {
+      const tMatch = m.match(/t\s*[=:]?\s*([-\d.]+)/);
+      const dfMatch = m.match(/df\s*[=:]?\s*(\d+)/);
+      const alphaMatch = m.match(/alpha\s*[=:]?\s*([\d.]+)|\b(0\.\d+)\b|(\d+)\s*%/);
+      const tailMatch = /dua\s*sisi|two.?tailed/.test(m) ? 'two-tailed' : /kiri|left/.test(m) ? 'left' : /kanan|right/.test(m) ? 'right' : 'two-tailed';
+      let alpha = null;
+      if (alphaMatch) {
+        const raw = alphaMatch[1] || alphaMatch[2] || alphaMatch[3];
+        if (raw) { alpha = parseFloat(raw); if (alpha > 1) alpha = alpha / 100; }
+      }
+      return { action: 'STUDENT_T_TEST', params: {
+        t: tMatch ? parseFloat(tMatch[1]) : null,
+        df: dfMatch ? parseInt(dfMatch[1]) : null,
+        alpha, tail: tailMatch
+      }};
+    }
+    // Probability calculator
+    if (/probabilit|distribusi.*normal|normal.*distribusi|buka.*probabilit|open.*probabilit/.test(m))
+      return {action:'OPEN_PROBABILITY_CALCULATOR', params:{}};
+    if (/berapa.*peluang.*z|peluang.*untuk.*z|probability.*z\s*=?\s*([-\d.]+)|calculate.*probability.*z\s*=?\s*([-\d.]+)|hitung.*probabilit.*z\s*=?\s*([-\d.]+)|buatkan.*distribusi.*normal.*z\s*=?\s*([-\d.]+)|what.*probability.*z\s*=?\s*([-\d.]+)/.test(m)) {
+      const match = m.match(/z\s*=?\s*([-\d.]+)/);
+      const z = match ? parseFloat(match[1]) : null;
+      return {action:'CALCULATE_NORMAL_PROBABILITY', params: { z }};
+    }
     return null;
   }
 
@@ -5455,7 +9775,7 @@ const AIAssistant = (() => {
       const varName = params.variable || (ds.variables[0] && ds.variables[0].name);
       if (!varName) return 'No variable found.';
       try {
-        const result = ProcedureRegistry.execute('frequencies', ds, { variables: [varName] });
+        const result = ProcedureRegistry.runProcedure('frequencies', ds, { variables: [varName] });
         Output.addResult('frequencies', result, { variables: [varName] });
         if (_navigate) _navigate('output');
         return `Ran Frequencies for **${varName}**. Results added to Output.`;
@@ -5467,7 +9787,7 @@ const AIAssistant = (() => {
       if (!numVars.length) return 'No numeric variables found.';
       const vars = params.variables || numVars.slice(0,5);
       try {
-        const result = ProcedureRegistry.execute('descriptives', ds, { variables: vars });
+        const result = ProcedureRegistry.runProcedure('descriptives', ds, { variables: vars });
         Output.addResult('descriptives', result, { variables: vars });
         if (_navigate) _navigate('output');
         return `Ran Descriptives for **${vars.join(', ')}**. Results added to Output.`;
@@ -5479,7 +9799,7 @@ const AIAssistant = (() => {
       if (scaleVars.length < 2) return 'Need at least 2 scale variables for correlation.';
       const vars = params.variables || scaleVars.slice(0,4);
       try {
-        const result = ProcedureRegistry.execute('correlation', ds, { variables: vars, method:'pearson' });
+        const result = ProcedureRegistry.runProcedure('correlation', ds, { variables: vars, method:'pearson' });
         Output.addResult('correlation', result, { variables: vars });
         if (_navigate) _navigate('output');
         return 'Ran Pearson Correlation for **'+vars.join(', ')+'**. Results added to Output.';
@@ -5492,7 +9812,7 @@ const AIAssistant = (() => {
       const v = ds.variables.find(x=>x.name===varName);
       if (!v) return 'Variable not found: '+varName+'. Available: '+ds.variables.map(x=>x.name).join(', ');
       try {
-        const result = ProcedureRegistry.execute('descriptives', ds, { variables: [varName] });
+        const result = ProcedureRegistry.runProcedure('descriptives', ds, { variables: [varName] });
         Output.addResult('descriptives', result, { variables: [varName] });
         if (_navigate) _navigate('output');
         return 'Ran Descriptives for **'+varName+'**. Results added to Output.';
@@ -5520,20 +9840,18 @@ const AIAssistant = (() => {
         const chartId = 'ai_pie_'+Date.now();
         area.innerHTML='';
         const wrapper = el('div',{class:'graph-output-wrap'});
-        const titleEl = el('div',{class:'graph-title'},'Pie Chart: '+varName+' (created by AI)');
-        const exportBtn = el('button',{class:'btn btn-sm',onclick:()=>{
-          const dom=document.getElementById(chartId);
-          if(!dom)return;
-          if(typeof echarts==='undefined'){notify('Chart library unavailable','error');return;}
-          const chart=echarts.getInstanceByDom(dom);
-          if(!chart)return;
-          const url=chart.getDataURL({type:'png',pixelRatio:2,backgroundColor:'#fff'});
-          const a=el('a',{href:url,download:'pie_'+varName+'.png'}); a.click();
-        }},'Export PNG');
+        const titleEl = el('div',{class:'graph-title'},'Pie Chart: '+varName+' (AI)');
         const chartDiv = el('div',{id:chartId,class:'graph-chart'});
-        wrapper.append(titleEl, exportBtn, chartDiv);
+        wrapper.append(titleEl, chartDiv);
         area.appendChild(wrapper);
         Charts.pieChart(chartId, sorted.map(e=>e[0]), sorted.map(e=>e[1]), 'Pie: '+varName);
+        setTimeout(()=>{
+          const inst = typeof echarts !== 'undefined' ? echarts.getInstanceByDom(document.getElementById(chartId)) : null;
+          if (inst) {
+            ChartExportManager.register({ id:chartId, title:'Pie Chart: '+varName, chartType:'pie', instance:inst, sourceModule:'ai', metadata:{variable:varName} });
+            wrapper.appendChild(ChartExportManager.buildToolbar(chartId));
+          }
+        }, 200);
       }, 300);
       return 'Creating pie chart for **'+varName+'**... Navigating to Graph Builder.';
     }},
@@ -5557,6 +9875,13 @@ const AIAssistant = (() => {
         wrapper.appendChild(chartDiv);
         area.appendChild(wrapper);
         Charts.histogram(chartId, vals, 'Histogram: '+varName, varName);
+        setTimeout(()=>{
+          const inst = typeof echarts !== 'undefined' ? echarts.getInstanceByDom(document.getElementById(chartId)) : null;
+          if (inst) {
+            ChartExportManager.register({ id:chartId, title:'Histogram: '+varName, chartType:'histogram', instance:inst, sourceModule:'ai', metadata:{variable:varName} });
+            wrapper.appendChild(ChartExportManager.buildToolbar(chartId));
+          }
+        }, 200);
       }, 300);
       return 'Creating histogram for **'+varName+'**...';
     }},
@@ -5578,9 +9903,86 @@ const AIAssistant = (() => {
         wrapper.appendChild(chartDiv);
         area.appendChild(wrapper);
         Charts.barChart(chartId, cats, counts, 'Frequencies: '+varName, varName);
+        setTimeout(()=>{
+          const inst = typeof echarts !== 'undefined' ? echarts.getInstanceByDom(document.getElementById(chartId)) : null;
+          if (inst) {
+            ChartExportManager.register({ id:chartId, title:'Bar Chart: '+varName, chartType:'bar', instance:inst, sourceModule:'ai', metadata:{variable:varName} });
+            wrapper.appendChild(ChartExportManager.buildToolbar(chartId));
+          }
+        }, 200);
       }, 300);
       return 'Creating bar chart for **'+varName+'**...';
-    }}
+  }},
+  OPEN_PROBABILITY_CALCULATOR: { handler: () => {
+    ProbabilityCalcUI.open();
+    return 'Opened Probability & Distributions Calculator.';
+  }},
+  CALCULATE_NORMAL_PROBABILITY: { handler: (params) => {
+    const z = params.z;
+    if (z == null || isNaN(z)) {
+      ProbabilityCalcUI.open();
+      return 'Opened Probability Calculator. Please enter a Z value.';
+    }
+    // Run calculation immediately
+    const result = ProbabilityCalc.calculateNormal({ mode:'z', z, tailType:'left', method:'exact' });
+    ProbabilityCalc.setLastResult(result);
+    ProbabilityCalcUI.open(z);
+    if (result.error) return `Error: ${result.error}`;
+    return `**Normal Distribution: Z = ${z}**\n\n` +
+      `P(Z ≤ ${z}) = ${result.probability.toFixed(7)} (${result.percentage.toFixed(4)}%)\n` +
+      `P(Z > ${z}) = ${result.rightTail.toFixed(7)}\n` +
+      `Two-tailed: ${(result.leftTail + result.rightTail).toFixed(7)}\n\n` +
+      `*(Exact calculation — Probability Calculator opened with Z pre-filled)*`;
+  }},
+  STUDENT_T_CRITICAL: { handler: (params) => {
+    StudentTUI.open();
+    const { df, alpha, tail } = params;
+    if (df == null || alpha == null) {
+      return '**Student\'s t Distribution** — Calculator opened.\n\nPlease enter df and α in the "Find Critical t" tab.';
+    }
+    const r = StudentTCalc.criticalT({ df, alpha, tail: tail || 'two-tailed' });
+    if (r.error) return `⚠ ${r.error}`;
+    const dispVal = r.tail === 'two-tailed'
+      ? `±${r.criticalValueAbs.toFixed(4)}`
+      : r.criticalValue.toFixed(4);
+    return `**Student's t — Critical value**\n\n` +
+      `df = ${r.df} | α = ${r.alpha} | ${r.tail}\n` +
+      `**t critical = ${dispVal}**\n` +
+      (r.tableAvailable ? `Reference table (t Student): ${r.tableValue}\n` : 'Reference table: exact calculation used\n') +
+      (r.tail === 'two-tailed' ? `(two-tailed → table α = ${r.tableAlpha})\n` : '') +
+      `\n*(Student's t Distribution module opened)*`;
+  }},
+  STUDENT_T_PROBABILITY: { handler: (params) => {
+    StudentTUI.open();
+    const { df, t, tail } = params;
+    if (df == null || t == null) {
+      return '**Student\'s t Distribution** — Calculator opened.\n\nPlease enter df and t in the "Probability / p-value" tab.';
+    }
+    const r = StudentTCalc.probability({ df, t, tail: tail || 'two-tailed' });
+    if (r.error) return `⚠ ${r.error}`;
+    const tailLabel = { left: `P(T ≤ ${r.t})`, right: `P(T ≥ ${r.t})`, 'two-tailed': 'two-tailed p-value' }[r.tail];
+    return `**Student's t — ${tailLabel}**\n\n` +
+      `t = ${r.t} | df = ${r.df} | ${r.tail}\n` +
+      `**p-value = ${r.pValue.toFixed(7)}** (${r.percentage.toFixed(4)}%)\n` +
+      `P(T ≤ t) = ${r.leftTail.toFixed(7)} | P(T ≥ t) = ${r.rightTail.toFixed(7)}\n` +
+      `\n*(Student's t Distribution module opened)*`;
+  }},
+  STUDENT_T_TEST: { handler: (params) => {
+    StudentTUI.open();
+    const { df, t, alpha, tail } = params;
+    if (df == null || t == null || alpha == null) {
+      return '**Student\'s t Distribution** — Calculator opened.\n\nPlease enter t, df, and α in the "Test t Statistic" tab.';
+    }
+    const r = StudentTCalc.testStatistic({ df, t, alpha, tail: tail || 'two-tailed' });
+    if (r.error) return `⚠ ${r.error}`;
+    const critDisp = r.tail === 'two-tailed' ? `±${r.tCriticalAbs.toFixed(4)}` : r.tCritical.toFixed(4);
+    return `**Student's t — Hypothesis Test**\n\n` +
+      `t observed = ${r.tObserved} | df = ${r.df} | α = ${r.alpha} | ${r.tail}\n` +
+      `t critical = ${critDisp}\n` +
+      `p-value = ${r.pValue.toFixed(7)}\n` +
+      `**Decision: ${r.decision}**\n` +
+      `\n*(Student's t Distribution module opened)*`;
+  }},
   };
 
   function runAction(intentResult, ds) {
@@ -5643,6 +10045,22 @@ const AIAssistant = (() => {
 
     if (/outlier|pencilan/.test(msg))
       return 'Penanganan outlier:\n• Identifikasi: Z-score > ±3, boxplot, Cook\'s distance > 1\n• Jangan hapus outlier secara otomatis\n• Pertimbangkan: apakah data entry error? apakah kasus valid?\n• Lakukan analisis dengan dan tanpa outlier, laporkan keduanya\n• Untuk regresi: Cook\'s distance dan leverage tersedia di output diagnostics';
+
+    if (/z.?score|distribusi normal|normal distribusi|probabilit|peluang.*z|z.*peluang/.test(msg)) {
+      const zMatch = msg.match(/z\s*[=:]\s*([-\d.]+)/);
+      if (zMatch) {
+        const z = parseFloat(zMatch[1]);
+        const r = ProbabilityCalc.calculateNormal({ mode:'z', z, tailType:'left', method:'exact' });
+        if (!r.error) {
+          return `**Normal Distribution: Z = ${z}**\n\n` +
+            `P(Z ≤ ${z}) = ${r.probability.toFixed(7)} (${r.percentage.toFixed(4)}%)\n` +
+            `P(Z > ${z}) = ${r.rightTail.toFixed(7)}\n` +
+            `Two-tailed p = ${(r.leftTail + r.rightTail).toFixed(7)}\n\n` +
+            `Gunakan **Analyze → Probability & Distributions → Probability Calculator** untuk visualisasi interaktif dan kalkulasi lebih lanjut.`;
+        }
+      }
+      return 'Gunakan **Analyze → Probability & Distributions → Probability Calculator** untuk:\n• Menghitung P(Z ≤ z), P(Z > z), P(z₁ < Z < z₂)\n• Konversi nilai X ke Z-score\n• Menemukan Z kritis dari probabilitas\n• Menghitung p-value dari Z\n• Melihat visualisasi kurva normal dengan daerah yang diarsir\n\nContoh: P(Z ≤ 1.96) ≈ 0.9750 (97.50%)';
+    }
 
     if (/halo|hello|hi|selamat|apa kabar/.test(msg))
       return 'Halo! Saya adalah **AI Assistant SOCIOSTAT** — asisten statistik berbasis aturan.\n\nSaya dapat membantu:\n• Memilih prosedur statistik yang tepat\n• Menjelaskan asumsi dan interpretasi\n• Membimbing alur penelitian\n• Mengidentifikasi potensi masalah dalam data\n\nApa yang ingin Anda analisis?';
@@ -6536,22 +10954,28 @@ const GraphsModule = (() => {
     const wrapper = el('div', { class:'graph-output-wrap' });
     const titleStr = `${chartType}: ${xVarName || ''}`;
     const titleEl = el('div', { class:'graph-title' }, titleStr);
-    const exportBtn = el('button', { class:'btn btn-sm', onclick:()=>exportChart(chartId) }, 'Export PNG');
     const chartDiv = el('div', { id:chartId, class:'graph-chart' });
-    wrapper.append(titleEl, exportBtn, chartDiv);
+    wrapper.append(titleEl, chartDiv);
     area.appendChild(wrapper);
     drawGraphInto(ds, chartType, xVarName, yVarNames, groupVarName, chartId, false);
+    // Register with ChartExportManager after chart is initialised (next tick)
+    setTimeout(() => {
+      const dom = document.getElementById(chartId);
+      const inst = dom && typeof echarts !== 'undefined' ? echarts.getInstanceByDom(dom) : null;
+      if (inst) {
+        ChartExportManager.register({
+          id: chartId, title: titleStr,
+          chartType: chartType.toLowerCase().replace(/[^a-z]/g, '_'),
+          instance: inst, sourceModule: 'graphs',
+          metadata: { type: chartType, variable: xVarName || '' }
+        });
+        wrapper.appendChild(ChartExportManager.buildToolbar(chartId));
+      }
+    }, 200);
   }
 
   function exportChart(chartId) {
-    const dom = document.getElementById(chartId);
-    if (!dom) return;
-    if (typeof echarts === 'undefined') { notify('Chart library unavailable — cannot export.', 'error'); return; }
-    const chart = echarts.getInstanceByDom(dom);
-    if (!chart) return;
-    const url = chart.getDataURL({ type:'png', pixelRatio:2, backgroundColor:'#fff' });
-    const a = el('a', { href:url, download:'sociostat_chart.png' });
-    a.click();
+    ChartExportManager.downloadPNG(chartId);
   }
 
   return { init, render };
@@ -6632,6 +11056,7 @@ const CommandPalette = (() => {
     { group: 'Analyze', label: 'Reliability (Cronbach Alpha)', icon: '📊', action: () => AnalysisDialogs.openReliability() },
     { group: 'Analyze', label: 'Factor Analysis', icon: '📊', action: () => AnalysisDialogs.openFactorAnalysis() },
     { group: 'Analyze', label: 'Nonparametric Tests', icon: '📊', action: () => AnalysisDialogs.openNonparametric() },
+    { group: 'Analyze', label: 'Probability Calculator (Normal)', icon: '📐', action: () => ProbabilityCalcUI.open() },
     { group: 'Transform', label: 'Compute Variable', icon: '⇄', action: () => TransformDialogs.openComputeVariable() },
     { group: 'Transform', label: 'Recode Variable', icon: '⇄', action: () => TransformDialogs.openRecode() },
     { group: 'Transform', label: 'Select Cases (Filter)', icon: '⇄', action: () => TransformDialogs.openSelectCases() },
@@ -7600,6 +12025,13 @@ const App = (() => {
       { title: 'Survival Analysis', desc: '', items: [
         { label: 'Kaplan-Meier', desc: 'Survival curves and log-rank test', badge: 'advanced', fn: () => AnalysisDialogs.openKaplanMeier() },
       ]},
+      { title: 'Probability & Distributions', desc: '', items: [
+        { label: 'Probability Calculator', desc: 'Normal distribution: Z-score, probability, critical Z, p-value.', badge: 'beginner', fn: () => ProbabilityCalcUI.open() },
+        { label: "Student's t Distribution", desc: 'Critical t, p-value, hypothesis test, reference table, graph.', badge: 'intermediate', fn: () => StudentTUI.open() },
+        { label: 'Chi-Square Distribution', desc: 'Coming soon', badge: 'intermediate', fn: () => notify('Chi-square distribution — coming soon', 'warning', 2000) },
+        { label: 'F Distribution', desc: 'Coming soon', badge: 'intermediate', fn: () => notify('F distribution — coming soon', 'warning', 2000) },
+        { label: 'Binomial / Poisson / Hypergeometric', desc: 'Coming soon', badge: 'intermediate', fn: () => notify('Discrete distributions — coming soon', 'warning', 2000) },
+      ]},
     ];
 
     const badgeColor = { beginner: '#dcfce7', intermediate: '#fef3c7', advanced: '#ede9fe' };
@@ -7863,6 +12295,108 @@ const App = (() => {
     }
     renderLibStatusRows();
     wrap.appendChild(statusSec);
+
+    // Developer Diagnostics
+    const devSec = el('div', { class: 'settings-section' });
+    devSec.appendChild(el('h4', {}, '🔬 Developer Diagnostics'));
+    devSec.appendChild(el('p', { class: 'muted small' }, 'Trace the data pipeline to diagnose N=0 issues. Results print to the browser console (F12) and appear below.'));
+
+    const diagOutput = el('div', {
+      style: {
+        fontFamily: 'monospace', fontSize: '11px', background: '#1e1e2e', color: '#cdd6f4',
+        borderRadius: '8px', padding: '12px', marginTop: '10px', maxHeight: '400px',
+        overflowY: 'auto', whiteSpace: 'pre', display: 'none', lineHeight: '1.5'
+      }
+    });
+
+    function showDiagResult(text) {
+      diagOutput.style.display = '';
+      diagOutput.textContent = text;
+    }
+
+    // Row 1: Self-test + active dataset
+    const row1 = el('div', { class: 'form-row', style: { flexWrap: 'wrap', gap: '8px' } });
+
+    row1.appendChild(el('button', {
+      class: 'btn btn-sm btn-primary',
+      onclick: () => {
+        const r = DataPipelineInspector.printSelfTest();
+        const lines = ['╔══ PIPELINE SELF-TEST ══╗'];
+        Object.entries(r).forEach(([k, v]) => {
+          if (k === '_summary') return;
+          lines.push(`[${v.pass ? 'PASS' : 'FAIL'}] ${k}: ${v.detail}`);
+        });
+        lines.push('');
+        lines.push(`CONCLUSION: ${r._summary.conclusion}`);
+        showDiagResult(lines.join('\n'));
+      }
+    }, '▶ Run Pipeline Self-Test'));
+
+    row1.appendChild(el('button', {
+      class: 'btn btn-sm',
+      onclick: () => {
+        const ds = AppState.get('activeDataset');
+        if (!ds) { showDiagResult('No active dataset loaded. Import a CSV first.'); return; }
+        const text = DataPipelineInspector.printInspect(ds);
+        showDiagResult(text);
+      }
+    }, '🔍 Inspect Active Dataset'));
+
+    row1.appendChild(el('button', {
+      class: 'btn btn-sm',
+      onclick: () => {
+        const ds = AppState.get('activeDataset');
+        if (!ds) { showDiagResult('No active dataset.'); return; }
+        // Show first 3 raw case objects
+        const cases3 = ds.cases.slice(0, 3);
+        const lines = ['=== FIRST 3 RAW CASE OBJECTS ==='];
+        cases3.forEach((row, i) => { lines.push(`Case[${i}]: ${JSON.stringify(row)}`); });
+        lines.push('');
+        lines.push('=== VARIABLE METADATA ===');
+        ds.variables.forEach(v => {
+          lines.push(`  ${v.name} | type:${v.type} | level:${v.measurementLevel} | missing:${JSON.stringify(v.missingValues||[])}`);
+        });
+        console.log(lines.join('\n'));
+        showDiagResult(lines.join('\n'));
+      }
+    }, '📋 Show Raw Cases'));
+
+    row1.appendChild(el('button', {
+      class: 'btn btn-sm',
+      onclick: () => {
+        const ds = AppState.get('activeDataset');
+        if (!ds) { showDiagResult('No active dataset.'); return; }
+        const firstNumVar = ds.variables.find(v => v.type === 'numeric');
+        if (!firstNumVar) { showDiagResult('No numeric variable found.'); return; }
+        try {
+          const resolved = Stats.resolveDataset(ds, [firstNumVar.name], {});
+          const lines = [
+            `=== RESOLVE TRACE: ${firstNumVar.name} ===`,
+            `Metadata: FOUND (type=${firstNumVar.type}, level=${firstNumVar.measurementLevel})`,
+            `Cases total: ${ds.cases.length}`,
+            `Raw col length: ${resolved.data[firstNumVar.name]?.length ?? 'N/A'}`,
+            `Resolved N (after listwise): ${resolved.n}`,
+            `Active filter: ${ds.activeFilter || 'NONE'}`,
+            `Weight: ${ds.weightVariable || 'NONE'}`,
+            `Warnings: ${resolved.warnings.join('; ') || 'none'}`,
+            '',
+            `First 5 resolved values: ${JSON.stringify((resolved.data[firstNumVar.name] || []).slice(0, 5))}`,
+          ];
+          // Also show first 5 raw values from cases
+          const raw5 = ds.cases.slice(0, 5).map(row => row[firstNumVar.name]);
+          lines.push(`First 5 raw case values: ${JSON.stringify(raw5)}`);
+          lines.push(`typeof first raw: ${typeof raw5[0]}`);
+          console.log(lines.join('\n'));
+          showDiagResult(lines.join('\n'));
+        } catch (e) {
+          showDiagResult(`resolveDataset threw: ${e.message}\n${e.stack || ''}`);
+        }
+      }
+    }, '⚙ Trace resolveDataset'));
+
+    devSec.appendChild(row1);
+    devSec.appendChild(diagOutput);
+    wrap.appendChild(devSec);
 
     // About
     wrap.appendChild(el('div', { class: 'settings-section' },
@@ -8200,6 +12734,45 @@ const LibraryLoader = (() => {
       console.error('[SOCIOSTAT] DB init failed, running without persistence:', err);
       App.init();
     });
+
+    // Expose diagnostic helpers to the browser console so developers can run:
+    //   DataIntegrity.inspect(AppState.get('activeDataset'))
+    //   SS.ds()          → get active dataset
+    //   SS.check()       → run integrity check on active dataset
+    //   SS.inspect()     → print detailed report to console
+    window.DataIntegrity = DataIntegrity;
+    window.DataTypeConverter = DataTypeConverter;
+    window.SS = {
+      ds:      ()  => AppState.get('activeDataset'),
+      check:   ()  => DataIntegrity.check(AppState.get('activeDataset')),
+      inspect: ()  => DataIntegrity.inspect(AppState.get('activeDataset')),
+      migrate: ()  => {
+        const ds = AppState.get('activeDataset');
+        if (!ds) { console.log('No active dataset'); return; }
+        const r = DataIntegrity.migrateSchema(ds);
+        console.log('Migration result:', r);
+        return r;
+      },
+      resolve: (varNames) => {
+        const ds = AppState.get('activeDataset');
+        if (!ds) { console.log('No active dataset'); return; }
+        return Stats.resolveDataset(ds, varNames || ds.variables.slice(0,3).map(v=>v.name));
+      },
+      parse: (val) => DataTypeConverter.parseSemanticNumber(val),
+      convert: (varName, targetType, onInvalid) => {
+        const ds = AppState.get('activeDataset');
+        if (!ds) { console.log('No active dataset'); return; }
+        const r = DataTypeConverter.convertVariable(ds, varName, targetType, onInvalid || 'missing');
+        console.log('Conversion result:', r);
+        return r;
+      },
+      preview: (varName, targetType) => {
+        const ds = AppState.get('activeDataset');
+        if (!ds) { console.log('No active dataset'); return; }
+        return DataTypeConverter.previewConversion(ds, varName, targetType);
+      },
+    };
+    console.log('[SOCIOSTAT] Developer tools: SS.inspect(), SS.check(), SS.ds(), SS.resolve(["var"]), SS.parse(val), SS.convert("var","numeric"), SS.preview("var","numeric")');
   }
 
   document.addEventListener('DOMContentLoaded', () => {
