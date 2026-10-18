@@ -4,10 +4,51 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SOCIOSTAT — Statistical Analysis Workbench</title>
-  <link rel="stylesheet" href="style.css" />
 
-  <!-- ── Application loads first — optional libraries load async inside script.js ── -->
-  <script src="script.js" defer></script>
+  <!-- ── CSS: design tokens first, then layout, then components, then feature-specific ── -->
+  <link rel="stylesheet" href="./css/tokens.css" />
+  <link rel="stylesheet" href="./css/layout.css" />
+  <link rel="stylesheet" href="./css/components.css" />
+  <link rel="stylesheet" href="./css/data-editor.css" />
+  <link rel="stylesheet" href="./css/dialogs.css" />
+
+  <!-- ── JS load order (classic scripts, no ES modules — works when opened directly as a local file) ── -->
+  <!-- Layer 1: pure utilities — no dependencies -->
+  <script src="./js/core-utils.js" defer></script>
+  <!-- Layer 2: state + persistence primitives -->
+  <script src="./js/app-state.js" defer></script>
+  <script src="./js/storage-project.js" defer></script>
+  <!-- Layer 3: statistical engine — depends on core-utils only -->
+  <script src="./js/statistics-core.js" defer></script>
+  <script src="./js/statistical-procedures.js" defer></script>
+  <script src="./js/statistics-distributions.js" defer></script>
+  <!-- Layer 4: dataset utilities — depend on statistics-core -->
+  <script src="./js/dataset-model.js" defer></script>
+  <script src="./js/data-type-converter.js" defer></script>
+  <!-- Layer 4b: data quality + eligibility — depend on data-type-converter -->
+  <script src="./js/data-quality.js" defer></script>
+  <script src="./js/analysis-eligibility.js" defer></script>
+  <!-- Layer 5: data editor UI — depend on app-state, storage-project, core-utils -->
+  <script src="./js/data-import-export.js" defer></script>
+  <script src="./js/data-view.js" defer></script>
+  <script src="./js/variable-view.js" defer></script>
+  <!-- Layer 6: analysis UI — depend on statistics-*, app-state -->
+  <script src="./js/student-t-ui.js" defer></script>
+  <script src="./js/analysis-dialogs.js" defer></script>
+  <script src="./js/probability-ui.js" defer></script>
+  <!-- Layer 7: output + chart + syntax + AI -->
+  <script src="./js/output-history.js" defer></script>
+  <script src="./js/chart-engine-export.js" defer></script>
+  <script src="./js/syntax-engine.js" defer></script>
+  <script src="./js/ai-assistant.js" defer></script>
+  <!-- Layer 8: transforms + graphs -->
+  <script src="./js/transform.js" defer></script>
+  <script src="./js/graph-builder.js" defer></script>
+  <!-- Layer 9: UI helpers + i18n — depend on multiple modules above -->
+  <script src="./js/i18n-settings.js" defer></script>
+  <script src="./js/ui-helpers.js" defer></script>
+  <!-- Layer 10: application entry point — must be last -->
+  <script src="./js/app-bootstrap.js" defer></script>
 </head>
 <body>
   <div id="app">

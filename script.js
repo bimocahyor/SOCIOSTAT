@@ -5420,19 +5420,22 @@ const ImportWizard = (() => {
 
 const DataView = (() => {
   const PAGE = 200;
+  const PLACEHOLDER_TOTAL = 70; // minimum visible rows (actual + placeholders)
   let _container=null, _dataset=null, _page=0, _sortKey=null, _sortDir='asc';
   // Stable DOM references — never recreated on selection change
-  let _tdMap=null;   // Map: "rowIdx:varIdx" → <td>
+  let _tdMap=null;   // Map: "rowIdx:varIdx" → <td>  (rowIdx for placeholders: 'ph:N')
   let _trMap=null;   // Map: rowIdx → <tr>
   let _visVars=[];   // current visible variables (for this render)
   let _caseSlice=[];  // cases[start..end] references
 
   // Editor & selection state
-  let _editCell=null;  // { td, rowIdx, varName, origVal }
+  let _editCell=null;  // { td, rowIdx, varName, origVal, isPlaceholder }
   let _selCell=null;   // { rowIdx, varName, varIdx }
   let _undoStack=[], _redoStack=[];
   let _clipboard=null;
   let _scrollEl=null;
+  // Placeholder row selection state (separate from _selCell — not actual cases)
+  let _selPlaceholder=null, _lastPhTd=null;
 
   function init(container) { _container=container; }
 
@@ -5464,8 +5467,22 @@ const DataView = (() => {
         _dataset.updatedAt=new Date().toISOString();
         Project.markDirty(); render(_dataset);
       }
+    } else if (e.type==='deleteVar') {
+      // Undo: restore the variable and its case values
+      _dataset.variables.splice(e.varIdx,0,e.varDef);
+      _dataset.cases.forEach((r,ri)=>{ r[e.varName]=e.caseValues[ri]??null; });
+      _dataset.updatedAt=new Date().toISOString();
+      Project.markDirty(); render(_dataset);
     } else if (e.type==='deleteRow') {
       _dataset.cases.splice(e.rowIdx,0,e.row);
+      _dataset.updatedAt=new Date().toISOString();
+      Project.markDirty(); render(_dataset);
+    } else if (e.type==='pasteBlock') {
+      // Restore variables first, then cases
+      _dataset.variables.length=0;
+      e.before.vars.forEach(v=>_dataset.variables.push({...v}));
+      _dataset.cases.length=0;
+      e.before.cases.forEach(r=>_dataset.cases.push({...r}));
       _dataset.updatedAt=new Date().toISOString();
       Project.markDirty(); render(_dataset);
     }
@@ -5489,8 +5506,25 @@ const DataView = (() => {
       _dataset.cases.forEach(r=>{ r[e.varName]=null; });
       _dataset.updatedAt=new Date().toISOString();
       Project.markDirty(); render(_dataset);
+    } else if (e.type==='deleteVar') {
+      // Redo: remove variable again
+      const vi=_dataset.variables.findIndex(v=>v.name===e.varName);
+      if (vi>=0) {
+        _dataset.variables.splice(vi,1);
+        _dataset.cases.forEach(r=>delete r[e.varName]);
+        _dataset.updatedAt=new Date().toISOString();
+        Project.markDirty(); render(_dataset);
+      }
     } else if (e.type==='deleteRow') {
       _dataset.cases.splice(e.rowIdx,1);
+      _dataset.updatedAt=new Date().toISOString();
+      Project.markDirty(); render(_dataset);
+    } else if (e.type==='pasteBlock') {
+      // Restore to after-paste state
+      _dataset.variables.length=0;
+      e.after.vars.forEach(v=>_dataset.variables.push({...v}));
+      _dataset.cases.length=0;
+      e.after.cases.forEach(r=>_dataset.cases.push({...r}));
       _dataset.updatedAt=new Date().toISOString();
       Project.markDirty(); render(_dataset);
     }
@@ -5505,57 +5539,134 @@ const DataView = (() => {
     notify('Copied','success',1200);
   }
 
-  function pasteSelected() {
-    if (!_selCell||!_dataset) return;
-    const {rowIdx,varName}=_selCell;
-    const oldVal=_dataset.cases[rowIdx][varName];
-    const v=_dataset.variables.find(x=>x.name===varName);
+  /* ── Clipboard parsing ───────────────────────────────────── */
+  // Parse clipboard text into a 2-D array of strings.
+  // Rules:
+  //   • Normalise CRLF → LF before splitting.
+  //   • Strip exactly one trailing LF produced by spreadsheet apps.
+  //   • Split on LF to get rows; split each row on TAB to get cells.
+  //   • Do NOT remove interior empty rows — their position must be preserved.
+  //   • Empty cells inside a row are kept as '' so column alignment is intact.
+  function _parseClipboardText(text) {
+    // Normalise Windows line endings
+    let t = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    // Strip exactly one terminal newline (spreadsheet apps always add one)
+    if (t.endsWith('\n')) t = t.slice(0, -1);
+    if (t === '') return [['']];
+    return t.split('\n').map(row => row.split('\t'));
+  }
 
-    // Try system clipboard first, fall back to internal
-    const doApply=(text)=>{
-      // Multi-cell tab-separated paste
-      const lines=text.split('\n').filter(l=>l!=='');
-      if (lines.length===1&&!lines[0].includes('\t')) {
-        // Single cell
-        let val=text===''?null:text;
-        if (v&&v.type==='numeric') {
-          const n=Number(text); val=(text==='')?null:(!isNaN(n)?n:null);
-          if (text!==''&&isNaN(Number(text))) { notify('Clipboard value is not numeric — paste skipped','warning'); return; }
+  /* ── Atomic paste apply ──────────────────────────────────── */
+  function _applyPasteText(text) {
+    if (!_dataset) return;
+
+    // Determine destination: real cell or placeholder cell
+    let startRow, startVarIdx;
+    if (_selCell) {
+      startRow    = _selCell.rowIdx;
+      startVarIdx = _selCell.varIdx;
+    } else if (_selPlaceholder) {
+      startRow    = _selPlaceholder.absIdx;
+      startVarIdx = _selPlaceholder.varIdx;
+    } else {
+      return; // nothing selected
+    }
+
+    const grid = _parseClipboardText(text);
+    if (!grid.length) return;
+
+    const numPasteRows = grid.length;
+    const numPasteCols = Math.max(...grid.map(r => r.length));
+    const visVars = _dataset.variables.filter(x => x.visibility !== false);
+    const endVarIdx = startVarIdx + numPasteCols - 1;
+
+    // ── 1. Snapshot before state for atomic undo ─────────────
+    const snapCases      = _dataset.cases.map(r => ({...r}));
+    const snapVarCount   = _dataset.variables.length;
+    const snapVars       = _dataset.variables.map(v => ({...v}));
+
+    // ── 2. Extend columns if needed ──────────────────────────
+    const neededVars = endVarIdx + 1; // total visible vars required
+    const addedVarNames = [];
+    if (neededVars > visVars.length) {
+      const colsToAdd = neededVars - visVars.length;
+      for (let c = 0; c < colsToAdd; c++) {
+        let n = _dataset.variables.length + 1;
+        let name = 'var' + String(n).padStart(3, '0');
+        while (_dataset.variables.some(v => v.name === name)) {
+          n++; name = 'var' + String(n).padStart(3, '0');
         }
-        if (val!==oldVal) pushUndo({type:'cell',rowIdx,varName,oldVal,newVal:val});
-        _dataset.cases[rowIdx][varName]=val;
-        _dataset.updatedAt=new Date().toISOString();
-        Project.markDirty();
-        _refreshCell(rowIdx,varName);
-      } else {
-        // Multi-cell paste
-        const visVars=_dataset.variables.filter(x=>x.visibility!==false);
-        let ri=rowIdx;
-        lines.forEach(line=>{
-          if (ri>=_dataset.cases.length) return;
-          const cells=line.split('\t');
-          cells.forEach((cellText,ci)=>{
-            const vi=_selCell.varIdx+ci;
-            if (vi>=visVars.length) return;
-            const vn=visVars[vi].name;
-            const vv=visVars[vi];
-            let val=cellText===''?null:cellText;
-            if (vv&&vv.type==='numeric') { const n=Number(cellText); val=(cellText==='')?null:(!isNaN(n)?n:null); }
-            const ov=_dataset.cases[ri][vn];
-            if (val!==ov) pushUndo({type:'cell',rowIdx:ri,varName:vn,oldVal:ov,newVal:val});
-            _dataset.cases[ri][vn]=val;
-          });
-          ri++;
-        });
-        _dataset.updatedAt=new Date().toISOString();
-        Project.markDirty(); render(_dataset);
+        const varDef = {
+          id: uuid(), name, label: '', type: 'numeric', width: 8, decimals: 2,
+          valueLabels: {}, missingValues: [], measurementLevel: 'scale',
+          role: 'input', visibility: true
+        };
+        _dataset.variables.push(varDef);
+        _dataset.cases.forEach(r => { r[name] = null; });
+        addedVarNames.push(name);
       }
-    };
+    }
 
+    // Refresh visible-vars list after potential column additions
+    const visVarsNow = _dataset.variables.filter(x => x.visibility !== false);
+
+    // ── 3. Extend rows if needed ──────────────────────────────
+    const requiredCaseCount = startRow + numPasteRows;
+    if (requiredCaseCount > _dataset.cases.length) {
+      for (let ri = _dataset.cases.length; ri < requiredCaseCount; ri++) {
+        const row = {};
+        _dataset.variables.forEach(v => { row[v.name] = null; });
+        _dataset.cases.push(row);
+      }
+    }
+
+    // ── 4. Write pasted values ────────────────────────────────
+    for (let r = 0; r < numPasteRows; r++) {
+      const ri = startRow + r;
+      const pasteRow = grid[r];
+      for (let c = 0; c < numPasteCols; c++) {
+        const vi = startVarIdx + c;
+        if (vi >= visVarsNow.length) break;
+        const vDef = visVarsNow[vi];
+        const cellText = (c < pasteRow.length) ? pasteRow[c] : '';
+        let val = cellText === '' ? null : cellText;
+        if (vDef && vDef.type === 'numeric') {
+          const n = Number(cellText);
+          val = (cellText === '') ? null : (!isNaN(n) ? n : null);
+        }
+        _dataset.cases[ri][vDef.name] = val;
+      }
+    }
+
+    // ── 5. Snapshot after state ───────────────────────────────
+    const snapCasesAfter  = _dataset.cases.map(r => ({...r}));
+    const snapVarsAfter   = _dataset.variables.map(v => ({...v}));
+
+    // ── 6. Push ONE atomic undo entry ────────────────────────
+    pushUndo({
+      type: 'pasteBlock',
+      before: { cases: snapCases,      vars: snapVars,      varCount: snapVarCount },
+      after:  { cases: snapCasesAfter, vars: snapVarsAfter }
+    });
+
+    _dataset.updatedAt = new Date().toISOString();
+    Project.markDirty();
+    render(_dataset);
+  }
+
+  /* ── pasteSelected (keyboard shortcut fallback) ──────────── */
+  function pasteSelected() {
+    if (!_selCell && !_selPlaceholder) return;
+    if (!_dataset) return;
+    // navigator.clipboard.readText is async — used as fallback only
     if (navigator.clipboard?.readText) {
-      navigator.clipboard.readText().then(doApply).catch(()=>{ if(_clipboard) doApply(_clipboard.value==null?'':String(_clipboard.value)); });
-    } else if (_clipboard) {
-      doApply(_clipboard.value==null?'':String(_clipboard.value));
+      navigator.clipboard.readText()
+        .then(text => _applyPasteText(text))
+        .catch(() => {
+          if (_clipboard != null) _applyPasteText(_clipboard.value == null ? '' : String(_clipboard.value));
+        });
+    } else if (_clipboard != null) {
+      _applyPasteText(_clipboard.value == null ? '' : String(_clipboard.value));
     }
   }
 
@@ -5592,15 +5703,33 @@ const DataView = (() => {
       metadata:{},transformationHistory:[],
       createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()
     };
-    ['var001','var002','var003'].forEach(vn=>{
+    // 20 default variable shells, no actual cases
+    for (let i=1;i<=20;i++){
+      const vn='var'+String(i).padStart(3,'0');
       ds.variables.push({id:uuid(),name:vn,label:'',type:'numeric',width:8,decimals:2,
         valueLabels:{},missingValues:[],measurementLevel:'scale',role:'input',visibility:true});
-    });
-    for(let i=0;i<5;i++){
-      const row={}; ds.variables.forEach(v=>row[v.name]=null); ds.cases.push(row);
     }
+    // cases starts empty — placeholder rows handle visual display
     AppState.set('activeDataset',ds);
     Project.markDirty(); render(ds);
+  }
+
+  /* ── Delete Variable from Data View ─────────────────────────── */
+  function deleteVariableByName(dataset, varName) {
+    const vi=dataset.variables.findIndex(v=>v.name===varName);
+    if (vi<0) return;
+    if (!confirm(`Delete variable "${varName}"?\n\nThis will remove all data in this column.\nThis action can be undone with Ctrl+Z.`)) return;
+    const varDef={...dataset.variables[vi]};
+    const caseValues=dataset.cases.map(r=>r[varName]??null);
+    pushUndo({type:'deleteVar',varIdx:vi,varName,varDef,caseValues});
+    dataset.variables.splice(vi,1);
+    dataset.cases.forEach(r=>delete r[varName]);
+    dataset.updatedAt=new Date().toISOString();
+    _selCell=null;
+    Project.markDirty(); render(dataset);
+    notify(`Variable "${varName}" deleted. Ctrl+Z to undo.`,'success');
+    // Keep Variable View in sync
+    if (window._sociostatRenderDataModule) window._sociostatRenderDataModule();
   }
 
   /* ── Cell display helper ─────────────────────────────────── */
@@ -5633,6 +5762,8 @@ const DataView = (() => {
 
   /* ── Selection: CSS-only, no table rebuild ───────────────── */
   function _applySelection(newSel) {
+    // Also clear any placeholder selection
+    _clearPlaceholderSel();
     // Clear old
     if (_selCell) {
       const pageStart=_page*PAGE;
@@ -5667,6 +5798,24 @@ const DataView = (() => {
     });
   }
 
+  /* ── Show column-header context menu ─────────────────────── */
+  function _showColContextMenu(v, dataset, th) {
+    document.querySelectorAll('.col-ctx-menu').forEach(m=>m.remove());
+    const menu=el('div',{class:'col-ctx-menu'});
+    menu.appendChild(el('div',{class:'col-ctx-item',onclick:()=>{ menu.remove(); showVarContextPanel(v,dataset,th); }},'ⓘ Variable Info'));
+    menu.appendChild(el('div',{class:'col-ctx-item',onclick:()=>{ menu.remove(); if(window.App){App.setDataSubview('variable');App.renderDataModule();}}},'📋 Variable View'));
+    menu.appendChild(el('div',{class:'col-ctx-separator'}));
+    menu.appendChild(el('div',{class:'col-ctx-item col-ctx-danger',onclick:()=>{ menu.remove(); deleteVariableByName(dataset,v.name); }},'✕ Delete Variable…'));
+    document.body.appendChild(menu);
+    const rect=th.getBoundingClientRect();
+    let left=rect.left+window.scrollX;
+    let top=rect.bottom+window.scrollY+2;
+    if (left+180>window.innerWidth) left=window.innerWidth-185;
+    menu.style.cssText=`position:absolute;left:${left}px;top:${top}px;z-index:9999;`;
+    const closeMenu=ev=>{ if(!menu.contains(ev.target)){menu.remove();document.removeEventListener('mousedown',closeMenu);} };
+    setTimeout(()=>document.addEventListener('mousedown',closeMenu),10);
+  }
+
   /* ── Full render — builds stable DOM ─────────────────────── */
   function render(dataset) {
     _dataset=dataset;
@@ -5691,6 +5840,10 @@ const DataView = (() => {
     const start=_page*PAGE, end=Math.min(start+PAGE,total);
     _visVars=dataset.variables.filter(v=>v.visibility!==false);
 
+    // How many placeholder rows to add after real cases (on page 0)
+    const realRowsOnPage=end-start;
+    const placeholderCount=(_page===0) ? Math.max(0, PLACEHOLDER_TOTAL - total) : 0;
+
     // ── Toolbar ────────────────────────────────────────────
     const toolbar=el('div',{class:'data-toolbar data-toolbar-full'});
     toolbar.appendChild(el('div',{class:'data-toolbar-info'},
@@ -5703,8 +5856,9 @@ const DataView = (() => {
     btnGroup.appendChild(el('button',{class:'btn btn-sm btn-secondary',onclick:()=>addVariableCol(dataset),title:'Add variable column'},'+ Variable'));
     // Copy/Paste/Del only shown when selection active
     const hasSel=!!_selCell;
+    const hasAnySel=hasSel||!!_selPlaceholder;
     const copyBtn=el('button',{class:'btn btn-sm btn-copy',style:'display:'+(hasSel?'':'none'),title:'Copy (Ctrl+C)',onclick:()=>copySelected()},'Copy');
-    const pasteBtn=el('button',{class:'btn btn-sm btn-paste',style:'display:'+(hasSel?'':'none'),title:'Paste (Ctrl+V)',onclick:()=>pasteSelected()},'Paste');
+    const pasteBtn=el('button',{class:'btn btn-sm btn-paste',style:'display:'+(hasAnySel?'':'none'),title:'Paste (Ctrl+V)',onclick:()=>pasteSelected()},'Paste');
     const delBtn=el('button',{class:'btn btn-sm btn-danger btn-delrow',style:'display:'+(hasSel?'':'none'),onclick:()=>deleteSelectedRow(dataset)},'Del Row');
     btnGroup.appendChild(copyBtn); btnGroup.appendChild(pasteBtn); btnGroup.appendChild(delBtn);
     // Inspect button — opens DataIntegrity report in a modal overlay
@@ -5737,41 +5891,59 @@ const DataView = (() => {
     }, '🔍 Inspect'));
     toolbar.appendChild(btnGroup);
     const pgDiv=el('div',{class:'data-toolbar-page'});
-    pgDiv.appendChild(el('span',{class:'small muted'},(start+1)+'\u2013'+end+' of '+total));
-    pgDiv.appendChild(el('button',{class:'btn btn-xs',onclick:()=>{if(_page>0){_page--;render(dataset);}},disabled:_page===0},'\u25C0'));
-    pgDiv.appendChild(el('button',{class:'btn btn-xs',onclick:()=>{if(end<total){_page++;render(dataset);}},disabled:end>=total},'\u25B6'));
+    if (total>0) {
+      pgDiv.appendChild(el('span',{class:'small muted'},(start+1)+'\u2013'+end+' of '+total));
+      pgDiv.appendChild(el('button',{class:'btn btn-xs',onclick:()=>{if(_page>0){_page--;render(dataset);}},disabled:_page===0},'\u25C0'));
+      pgDiv.appendChild(el('button',{class:'btn btn-xs',onclick:()=>{if(end<total){_page++;render(dataset);}},disabled:end>=total},'\u25B6'));
+    } else {
+      pgDiv.appendChild(el('span',{class:'small muted'},'0 cases'));
+    }
     toolbar.appendChild(pgDiv);
     _container.appendChild(toolbar);
 
-    if (total>0) {
-      _container.appendChild(el('div',{class:'data-kb-hint'},
-        '\u2328 Click to select \u00B7 Type to edit \u00B7 Dbl-click to edit \u00B7 Arrow keys navigate \u00B7 Ctrl+C/V \u00B7 Ctrl+Z/Y undo/redo \u00B7 Del clear cell'
-      ));
-    }
+    _container.appendChild(el('div',{class:'data-kb-hint'},
+      '\u2328 Click to select \u00B7 Type/Dbl-click to edit \u00B7 Enter moves down \u00B7 Tab/Shift+Tab columns \u00B7 Ctrl+C/V \u00B7 Ctrl+Z/Y undo/redo \u00B7 Right-click header → Delete Variable'
+    ));
 
     // ── Scroll / Table ─────────────────────────────────────
     const scroll=el('div',{class:'data-grid-scroll',tabIndex:'0'});
     _scrollEl=scroll;
     scroll.addEventListener('keydown',(e)=>handleKeyboard(e,dataset,_visVars));
+    // Native paste event — fires before keydown; clipboardData is synchronously available here.
+    // Only intercept when a cell (real or placeholder) is selected and the user is NOT editing inline.
+    scroll.addEventListener('paste',(e)=>{
+      if (_editCell) return; // let the input handle its own paste
+      if (!_selCell && !_selPlaceholder) return;
+      const text=e.clipboardData?.getData('text/plain');
+      if (text==null) return;
+      e.preventDefault();
+      _applyPasteText(text);
+    });
 
     const tbl=el('table',{class:'data-grid'});
     const thead=el('thead');
     const hrow=el('tr');
     hrow.appendChild(el('th',{class:'row-num-header'},'#'));
     _visVars.forEach(v=>{
-      const th=el('th',{title:v.label||v.name});
+      const th=el('th',{title:(v.label||v.name)+'\nRight-click for options'});
       const nameSpan=document.createTextNode(v.name);
       th.appendChild(nameSpan);
       if (_sortKey===v.name) th.appendChild(document.createTextNode(_sortDir==='asc'?' \u25B2':' \u25BC'));
+      // Left-click: sort
       th.addEventListener('click',()=>{
         _sortKey=v.name; _sortDir=_sortDir==='asc'?'desc':'asc'; _page=0; render(dataset);
       });
-      // Double-click header → go to Variable View focused on this var
+      // Right-click: context menu (delete variable etc.)
+      th.addEventListener('contextmenu',e=>{
+        e.preventDefault(); e.stopPropagation();
+        _showColContextMenu(v,dataset,th);
+      });
+      // Double-click header → go to Variable View
       th.addEventListener('dblclick',e=>{
         e.stopPropagation();
         if (window.App) { App.setDataSubview('variable'); App.renderDataModule(); }
       });
-      const infoBtn=el('span',{class:'var-col-info',title:'Variable info (click) · Variable View (double-click)'},'ⓘ');
+      const infoBtn=el('span',{class:'var-col-info',title:'Variable info'},'ⓘ');
       infoBtn.addEventListener('click',e=>{ e.stopPropagation(); showVarContextPanel(v,dataset,th); });
       th.appendChild(infoBtn);
       hrow.appendChild(th);
@@ -5791,6 +5963,7 @@ const DataView = (() => {
     _caseSlice=cases.slice(start,end);
 
     const tbody=el('tbody');
+    // Real case rows
     for (let i=0;i<_caseSlice.length;i++) {
       const absIdx=start+i;
       const row=_caseSlice[i];
@@ -5807,7 +5980,7 @@ const DataView = (() => {
         const disp=_cellDisplayVal(v,val);
         if (disp==null) { td.appendChild(el('span',{class:'missing-val'},'.')); }
         else { td.textContent=disp; }
-        // Click: select only (no rebuild)
+        // Single-click: select
         td.addEventListener('click',()=>{
           if (_editCell) { commitEdit(); return; }
           _applySelection({rowIdx:absIdx,varName:v.name,varIdx:vi});
@@ -5822,12 +5995,83 @@ const DataView = (() => {
       });
       tbody.appendChild(tr);
     }
+
+    // Placeholder rows — visual only, not real cases
+    for (let ph=0; ph<placeholderCount; ph++) {
+      const phAbsIdx=total+ph; // row label = total+ph+1
+      const tr=el('tr',{class:'placeholder-row'});
+      tr.appendChild(el('td',{class:'row-num placeholder-num'},String(phAbsIdx+1)));
+      _visVars.forEach((v,vi)=>{
+        const td=el('td',{class:'data-cell placeholder-cell'});
+        _tdMap.set('ph:'+ph+':'+vi, td);
+        // Click on placeholder selects it without materializing
+        td.addEventListener('click',()=>{
+          if (_editCell) commitEdit();
+          _clearPlaceholderSel(); // clear previous placeholder selection first
+          // Deselect any real cell visually
+          if (_selCell) {
+            const pageStart=_page*PAGE;
+            const ok=_tdMap?.get((_selCell.rowIdx-pageStart)+':'+_selCell.varIdx);
+            if (ok) ok.classList.remove('cell-selected');
+            const tr2=_trMap?.get(_selCell.rowIdx);
+            if (tr2) tr2.classList.remove('row-selected');
+            _selCell=null;
+          }
+          _selPlaceholder={phIdx:ph,absIdx:phAbsIdx,varIdx:vi,varName:v.name};
+          td.classList.add('cell-selected');
+          _lastPhTd=td;
+          if (_scrollEl) _scrollEl.focus();
+        });
+        // Double-click or typing materializes the row and starts edit
+        td.addEventListener('dblclick',e=>{
+          e.stopPropagation();
+          _materializePlaceholderRows(dataset,phAbsIdx,v.name,vi,td);
+        });
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    }
+
     tbl.appendChild(tbody);
     scroll.appendChild(tbl);
     _container.appendChild(scroll);
 
-    // Restore edit state if editing was in progress (after sort/page change)
+    // Restore focus
     setTimeout(()=>{ if (_scrollEl) _scrollEl.focus(); },50);
+  }
+
+  function _clearPlaceholderSel() {
+    if (_lastPhTd) { _lastPhTd.classList.remove('cell-selected'); _lastPhTd=null; }
+    _selPlaceholder=null;
+  }
+
+  /* ── Materialize placeholder rows up to absIdx ───────────── */
+  function _materializePlaceholderRows(dataset,targetAbsIdx,varName,varIdx,startTd) {
+    const currentLen=dataset.cases.length;
+    if (targetAbsIdx<currentLen) return; // already a real row
+    // Create all needed rows from currentLen to targetAbsIdx
+    const batch=[];
+    for (let ri=currentLen; ri<=targetAbsIdx; ri++) {
+      const row={};
+      dataset.variables.forEach(v=>{ row[v.name]=null; });
+      dataset.cases.push(row);
+      batch.push({type:'addRow',rowIdx:ri,row:{...row}});
+    }
+    // Record as a single undo entry (batch)
+    batch.forEach(e=>pushUndo(e));
+    dataset.updatedAt=new Date().toISOString();
+    Project.markDirty();
+    render(dataset);
+    // After render, start edit on the target cell
+    setTimeout(()=>{
+      const pageStart=_page*PAGE;
+      const i=targetAbsIdx-pageStart;
+      const td=_tdMap?.get(i+':'+varIdx);
+      if (td) {
+        _applySelection({rowIdx:targetAbsIdx,varName,varIdx});
+        startEdit(td,dataset,targetAbsIdx,varName,dataset.cases[targetAbsIdx][varName]);
+      }
+    },30);
   }
 
   /* ── Keyboard handler ────────────────────────────────────── */
@@ -5843,6 +6087,26 @@ const DataView = (() => {
       if (e.key==='c'||e.key==='C') { e.preventDefault(); copySelected(); return; }
       if (e.key==='v'||e.key==='V') { e.preventDefault(); pasteSelected(); return; }
     }
+
+    // Handle keyboard when a placeholder row is selected
+    if (!_selCell && _selPlaceholder) {
+      const {phIdx,absIdx,varIdx,varName}=_selPlaceholder;
+      if ((e.key==='Enter'||e.key==='F2') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        _clearPlaceholderSel();
+        _materializePlaceholderRows(dataset,absIdx,varName,varIdx,null);
+        return;
+      }
+      if (e.key.length===1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        _clearPlaceholderSel();
+        _materializePlaceholderRows(dataset,absIdx,varName,varIdx,null);
+        // initChar will be typed after render
+        return;
+      }
+      return;
+    }
+
     if (!_selCell) return;
     let {rowIdx,varIdx}=_selCell;
     const total=dataset.cases.length;
@@ -5916,7 +6180,7 @@ const DataView = (() => {
         e.preventDefault();
         const committed=commitEdit();
         if (committed===false) return; // validation failed, stay in edit
-        // Move to next row
+        // Move to next row (materializes if in placeholder zone)
         const vis=dataset.variables.filter(x=>x.visibility!==false);
         const vi=vis.findIndex(x=>x.name===varName);
         const nextRow=rowIdx+1;
@@ -5925,6 +6189,9 @@ const DataView = (() => {
           const pageStart=_page*PAGE;
           const nextTd=_tdMap?.get((nextRow-pageStart)+':'+vi);
           if (nextTd) setTimeout(()=>startEdit(nextTd,dataset,nextRow,varName,dataset.cases[nextRow][varName]),0);
+        } else if (nextRow<dataset.cases.length+PLACEHOLDER_TOTAL) {
+          // Next row is a placeholder — materialize and edit
+          setTimeout(()=>_materializePlaceholderRows(dataset,nextRow,varName,vi,null),0);
         }
       } else if (e.key==='Tab') {
         e.preventDefault();
@@ -6090,7 +6357,7 @@ const DataView = (() => {
     },30);
   }
 
-  return { init, render, undo, redo };
+  return { init, render, undo, redo, deleteVariableByName };
 })();
 
 /* ── Variable Context Panel ──────────────────────────────────────────── */
@@ -6329,12 +6596,18 @@ const VariableView = (() => {
       const vis=el('input',{type:'checkbox',checked:v.visibility!==false,
         onchange:e=>{ dataset.variables[idx].visibility=e.target.checked; render(dataset); }});
       tr.appendChild(el('td',{},vis));
-      // Actions
-      const del=el('button',{class:'btn btn-sm btn-danger',onclick:()=>{
-        if (confirm(`Delete variable "${v.name}"?`)) {
-          dataset.variables.splice(idx,1);
-          dataset.cases.forEach(c=>delete c[v.name]);
-          Project.markDirty(); render(dataset);
+      // Actions — delegate to DataView.deleteVariableByName so undo/redo is consistent
+      const del=el('button',{class:'btn btn-sm btn-danger',title:'Delete variable (undoable)',onclick:()=>{
+        if (typeof DataView!=='undefined' && DataView.deleteVariableByName) {
+          DataView.deleteVariableByName(dataset,v.name);
+          // DataView.deleteVariableByName internally calls window._sociostatRenderDataModule
+          // which refreshes the active subview (Variable View or Data View).
+        } else {
+          if (confirm(`Delete variable "${v.name}"?`)) {
+            dataset.variables.splice(idx,1);
+            dataset.cases.forEach(c=>delete c[v.name]);
+            Project.markDirty(); render(dataset);
+          }
         }
       }},'✕');
       const up=el('button',{class:'btn btn-sm',onclick:()=>{
@@ -6516,34 +6789,99 @@ const VariableView = (() => {
    ══════════════════════════════════════════════════════════════════ */
 
 const AnalysisDialogs = (() => {
-  /* Generic variable list picker used by all dialogs */
-  function varList(dataset, selected, multi=true, onChange) {
-    const box=el('div',{class:'var-list'});
-    dataset.variables.forEach(v=>{
-      const isSelected=Array.isArray(selected)?selected.includes(v.name):(selected===v.name);
-      const item=el('div',{class:`var-item${isSelected?' selected':''}`},
+  /**
+   * Variable list picker — in-place DOM updates, scroll and focus preserved.
+   *
+   * Supports:
+   *   - Single-click select / Ctrl+click toggle / Shift+click range
+   *   - Ctrl+A / Cmd+A to select all (multi only)
+   *   - filter: optional predicate to restrict which variables appear
+   */
+  function varList(dataset, selected, multi=true, onChange, filterFn) {
+    const vars = filterFn ? dataset.variables.filter(filterFn) : dataset.variables;
+    const box=el('div',{class:'var-list',tabIndex:'0'});
+    let _lastClickIdx=-1; // for Shift+click range
+
+    function _isSel(vname) {
+      return Array.isArray(selected)?selected.includes(vname):(selected===vname);
+    }
+
+    function _updateItemEl(item, vname) {
+      const isSel=_isSel(vname);
+      item.classList.toggle('selected',isSel);
+      const chk=item.querySelector('.var-item-chk');
+      if (chk) chk.textContent=isSel?'✓':'';
+    }
+
+    function _toggleOne(vname, isSel) {
+      if (multi) {
+        const idx=selected.indexOf(vname);
+        if (isSel && idx>-1) selected.splice(idx,1);
+        else if (!isSel) selected.push(vname);
+      } else {
+        selected.length=0;
+        if (!isSel) selected.push(vname);
+      }
+    }
+
+    vars.forEach((v,vi)=>{
+      const isSel=_isSel(v.name);
+      const item=el('div',{class:`var-item${isSel?' selected':''}`},
+        el('span',{class:'var-item-chk'},isSel?'✓':''),
         el('span',{class:`var-type var-type-${v.type}`},v.type[0].toUpperCase()),
         el('span',{class:'var-name'},v.name),
         el('span',{class:'var-label muted'},v.label?` — ${v.label}`:'')
       );
-      item.onclick=()=>{
-        if(multi){
-          if(isSelected){ const idx=selected.indexOf(v.name); if(idx>-1)selected.splice(idx,1); }
-          else selected.push(v.name);
-        } else {
-          selected.length=0; if(!isSelected)selected.push(v.name);
-        }
-        onChange && onChange([...selected]);
-        // Re-render: toggle class
-        $$('.var-item',box).forEach(x=>x.classList.remove('selected'));
-        if(multi) selected.forEach(n=>{ const el2=box.querySelector(`[data-vn="${n}"]`); if(el2)el2.classList.add('selected'); });
-        else item.classList.toggle('selected',!isSelected);
-        // re-render full
-        const parent=box.parentElement; if(parent){ parent.replaceChild(varList(dataset,selected,multi,onChange),box); }
-      };
       item.dataset.vn=v.name;
+      item.dataset.vi=String(vi);
+
+      item.addEventListener('click',e=>{
+        const scrollTop=box.scrollTop;
+        const wasSel=_isSel(v.name);
+        if (multi && e.shiftKey && _lastClickIdx>=0) {
+          // Shift+click: select range
+          const lo=Math.min(vi,_lastClickIdx), hi=Math.max(vi,_lastClickIdx);
+          for (let k=lo;k<=hi;k++) {
+            const vk=vars[k];
+            if (!selected.includes(vk.name)) selected.push(vk.name);
+          }
+        } else if (multi && (e.ctrlKey||e.metaKey)) {
+          // Ctrl/Cmd+click: toggle individual
+          _toggleOne(v.name, wasSel);
+          _lastClickIdx=vi;
+        } else {
+          // Plain click
+          _toggleOne(v.name, wasSel);
+          _lastClickIdx=vi;
+        }
+        // Update all item elements in-place (preserves scroll)
+        $$('.var-item',box).forEach(it=>{
+          _updateItemEl(it, it.dataset.vn);
+        });
+        box.scrollTop=scrollTop;
+        onChange && onChange([...selected]);
+      });
+
       box.appendChild(item);
     });
+
+    // Ctrl+A / Cmd+A — select all (multi only)
+    box.addEventListener('keydown',e=>{
+      if (multi && (e.ctrlKey||e.metaKey) && (e.key==='a'||e.key==='A')) {
+        e.preventDefault();
+        const scrollTop=box.scrollTop;
+        // Add all vars not already selected
+        vars.forEach(v=>{ if(!selected.includes(v.name)) selected.push(v.name); });
+        $$('.var-item',box).forEach(it=>{ _updateItemEl(it,it.dataset.vn); });
+        box.scrollTop=scrollTop;
+        onChange && onChange([...selected]);
+      }
+    });
+
+    if (!vars.length) {
+      box.appendChild(el('div',{class:'var-list-empty'},'No compatible variables'));
+    }
+
     return box;
   }
 
@@ -6753,15 +7091,66 @@ const AnalysisDialogs = (() => {
   }
 
   // ── Linear Regression ─────────────────────────────────────────
+  // Compatibility filter: numeric (or boolean-as-dummy) variables only
+  function _isNumericCompat(v) {
+    return v.type==='numeric' || v.type==='boolean';
+  }
+
   function openLinearRegression() {
     const ds=getDataset(); if(!ds){notify('No dataset loaded','error');return;}
+    const numericVars=ds.variables.filter(_isNumericCompat);
+    const stringVars=ds.variables.filter(v=>!_isNumericCompat(v));
+
     const depVar=[],indepVars=[];
+
+    // Selection-count labels
+    const depCountLbl=el('span',{class:'muted small'},'');
+    const indepCountLbl=el('span',{class:'muted small'},'');
+
+    // Incompatible variable notice
+    let incompatNote=null;
+    if (stringVars.length>0) {
+      incompatNote=el('div',{class:'compat-note'},
+        '⚠ ',stringVars.length,' variable(s) hidden: ',
+        el('span',{class:'muted'},stringVars.map(v=>v.name).join(', ')),
+        ' (string/date — not compatible with linear regression)'
+      );
+    }
+
+    const depList=varList(ds,depVar,false,v=>{
+      depCountLbl.textContent=depVar.length?`${depVar[0]} selected`:'';
+    },_isNumericCompat);
+
+    const indepList=varList(ds,indepVars,true,()=>{
+      indepCountLbl.textContent=indepVars.length?`${indepVars.length} selected`:'';
+    },_isNumericCompat);
+
     const body=el('div',{class:'analysis-form two-col'},
-      el('div',{class:'form-section'},el('label',{},'Dependent variable:'),varList(ds,depVar,false,()=>{})),
-      el('div',{class:'form-section'},el('label',{},'Independent variable(s):'),varList(ds,indepVars,true,()=>{}))
+      incompatNote,
+      el('div',{class:'form-section'},
+        el('div',{class:'var-list-header'},
+          el('label',{},'Dependent variable (numeric):'),
+          depCountLbl
+        ),
+        depList
+      ),
+      el('div',{class:'form-section'},
+        el('div',{class:'var-list-header'},
+          el('label',{},'Independent variable(s) (numeric):'),
+          el('span',{class:'muted small'},'Ctrl+A selects all'),
+          indepCountLbl
+        ),
+        indepList
+      )
     );
     mkDialog('Linear Regression',body,()=>{
-      if(!depVar[0]||!indepVars.length){notify('Select dependent and independent variables','warning');return false;}
+      if(!depVar[0]){notify('Select a dependent variable','warning');return false;}
+      if(!indepVars.length){notify('Select at least one independent variable','warning');return false;}
+      // Validate selected variables are still numeric
+      const badDep=ds.variables.find(v=>v.name===depVar[0]&&!_isNumericCompat(v));
+      if (badDep) { notify(`Dependent variable "${depVar[0]}" is not numeric.`,'error'); return false; }
+      const badIndep=indepVars.find(vn=>{const v=ds.variables.find(x=>x.name===vn); return v&&!_isNumericCompat(v);});
+      if (badIndep) { notify(`Predictor "${badIndep}" is not numeric. Remove it or convert it first.`,'error'); return false; }
       runAnalysis('linear_regression',{dependent:depVar[0],independent:indepVars});
     });
   }
@@ -11557,7 +11946,7 @@ const I18N = (() => {
 
 const VarPicker = {
   /**
-   * Creates a variable picker list.
+   * Creates a variable picker list — in-place DOM updates, scroll and focus preserved.
    * @param {Array} variables  - array of variable objects with {name, label, type, measurementLevel}
    * @param {Array} selected   - mutable array of selected variable names (modified in-place)
    * @param {Object} opts
@@ -11565,23 +11954,70 @@ const VarPicker = {
    *   maxHeight  {string}   CSS max-height for the scrollable list
    *   onChange   {function} called with current selection array after every change
    *   filter     {function} optional filter predicate (v) => bool
+   *   showSearch {boolean}  show search input above list
+   *   showCount  {boolean}  show selected-count badge
    * @returns {HTMLElement}
    */
   create(variables, selected, opts = {}) {
-    const { multi = true, maxHeight = '180px', onChange, filter } = opts;
+    const { multi = true, maxHeight = '180px', onChange, filter, showSearch = false, showCount = false } = opts;
     const vars = filter ? variables.filter(filter) : variables;
 
-    const wrap = el('div', { class: 'varpicker' });
-    wrap.style.maxHeight = maxHeight;
+    const container = el('div', { class: 'varpicker-wrap' });
+    let _searchTerm = '';
+    let _lastClickIdx = -1;
 
-    function rebuild() {
-      wrap.innerHTML = '';
-      if (!vars.length) {
-        wrap.appendChild(el('div', { class: 'varpicker-empty' }, 'No variables available'));
-        return;
-      }
-      vars.forEach(v => {
-        const isSel = selected.includes(v.name);
+    // Optional search input
+    if (showSearch) {
+      const srch = el('input', { type: 'text', class: 'varpicker-search', placeholder: 'Search…' });
+      srch.addEventListener('input', () => { _searchTerm = srch.value.toLowerCase(); _refreshAll(); });
+      container.appendChild(srch);
+    }
+
+    // Count badge
+    const countBadge = showCount ? el('div', { class: 'varpicker-count' }, '') : null;
+    if (countBadge) container.appendChild(countBadge);
+    function _countText() { return selected.length ? `${selected.length} selected` : ''; }
+
+    // Action row (Select All / Clear) for multi pickers
+    if (multi) {
+      const actRow = el('div', { class: 'varpicker-actions' },
+        el('button', { class: 'btn btn-xs', onclick: () => {
+          vars.forEach(v => { if (!selected.includes(v.name)) selected.push(v.name); });
+          _refreshAll(); onChange && onChange([...selected]);
+        }}, 'All'),
+        el('button', { class: 'btn btn-xs', onclick: () => {
+          selected.length = 0;
+          _refreshAll(); onChange && onChange([...selected]);
+        }}, 'Clear')
+      );
+      container.appendChild(actRow);
+    }
+
+    const wrap = el('div', { class: 'varpicker', tabIndex: '0' });
+    wrap.style.maxHeight = maxHeight;
+    container.appendChild(wrap);
+
+    function _isSel(vname) { return selected.includes(vname); }
+
+    function _refreshAll() {
+      const scrollTop = wrap.scrollTop;
+      wrap.querySelectorAll('.varpicker-item').forEach(item => {
+        const vname = item.dataset.vn;
+        const isSel = _isSel(vname);
+        item.classList.toggle('selected', isSel);
+        const chk = item.querySelector('.varpicker-check');
+        if (chk) chk.textContent = isSel ? '✓' : '';
+        item.style.display = (_searchTerm && !vname.toLowerCase().includes(_searchTerm)) ? 'none' : '';
+      });
+      wrap.scrollTop = scrollTop;
+      if (countBadge) countBadge.textContent = _countText();
+    }
+
+    if (!vars.length) {
+      wrap.appendChild(el('div', { class: 'varpicker-empty' }, 'No variables available'));
+    } else {
+      vars.forEach((v, vi) => {
+        const isSel = _isSel(v.name);
         const item = el('div', { class: `varpicker-item${isSel ? ' selected' : ''}` },
           el('span', { class: 'varpicker-check' }, isSel ? '✓' : ''),
           el('span', { class: `varpicker-type varpicker-type-${v.type || 'numeric'}` },
@@ -11590,27 +12026,53 @@ const VarPicker = {
           v.label ? el('span', { class: 'varpicker-label' }, v.label) : null
         );
         item.dataset.vn = v.name;
-        item.onclick = () => {
-          if (multi) {
-            const idx = selected.indexOf(v.name);
-            if (idx >= 0) selected.splice(idx, 1);
+        item.dataset.vi = String(vi);
+
+        item.addEventListener('click', e => {
+          const scrollTop = wrap.scrollTop;
+          const wasSel = _isSel(v.name);
+          if (multi && e.shiftKey && _lastClickIdx >= 0) {
+            const lo = Math.min(vi, _lastClickIdx), hi = Math.max(vi, _lastClickIdx);
+            for (let k = lo; k <= hi; k++) {
+              if (!selected.includes(vars[k].name)) selected.push(vars[k].name);
+            }
+          } else if (multi && (e.ctrlKey || e.metaKey)) {
+            if (wasSel) { const idx = selected.indexOf(v.name); if (idx >= 0) selected.splice(idx, 1); }
             else selected.push(v.name);
+            _lastClickIdx = vi;
           } else {
-            selected.length = 0;
-            if (!isSel) selected.push(v.name);
+            if (multi) {
+              if (wasSel) { const idx = selected.indexOf(v.name); if (idx >= 0) selected.splice(idx, 1); }
+              else selected.push(v.name);
+            } else {
+              selected.length = 0;
+              if (!wasSel) selected.push(v.name);
+            }
+            _lastClickIdx = vi;
           }
-          rebuild();
+          _refreshAll();
+          wrap.scrollTop = scrollTop;
           onChange && onChange([...selected]);
-        };
+        });
+
         wrap.appendChild(item);
       });
     }
-    rebuild();
-    return wrap;
+
+    // Ctrl+A / Cmd+A
+    wrap.addEventListener('keydown', e => {
+      if (multi && (e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+        e.preventDefault();
+        vars.forEach(v => { if (!selected.includes(v.name)) selected.push(v.name); });
+        _refreshAll(); onChange && onChange([...selected]);
+      }
+    });
+
+    return container;
   },
 
   /**
-   * Shorthand: single-select picker that shows the picked value in a display element.
+   * Shorthand: single-select picker.
    */
   single(variables, onSelect, opts = {}) {
     const sel = [];
