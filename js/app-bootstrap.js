@@ -36,6 +36,101 @@ const App = (() => {
     }
   }
 
+  /* ── Mobile Bottom Navigation builder ────────────────────────────
+     Five primary items + "More" sheet for secondary modules.
+     All navigation goes through the existing navigate() function.
+  ─────────────────────────────────────────────────────────────── */
+  function _buildMobileNav() {
+    // Primary bottom-nav items
+    const PRIMARY = [
+      { id: 'home',    icon: '⌂', label: 'Home' },
+      { id: 'data',    icon: '⊞', label: 'Data' },
+      { id: 'analyze', icon: '📊', label: 'Analyze' },
+      { id: 'graphs',  icon: '📈', label: 'Graphs' },
+    ];
+    // Secondary items in the "More" sheet
+    const SECONDARY = [
+      { id: 'transform', icon: '⇄',  label: 'Transform' },
+      { id: 'output',    icon: '📋', label: 'Output' },
+      { id: 'history',   icon: '🕐', label: 'History' },
+      { id: 'syntax',    icon: '📝', label: 'Syntax' },
+      { id: 'ai',        icon: '🤖', label: 'AI Assistant' },
+      { id: 'settings',  icon: '⚙',  label: 'Settings' },
+      { id: 'help',      icon: '❓', label: 'Help' },
+    ];
+
+    const nav = el('div', { class: 'mobile-bottom-nav', id: 'mobile-bottom-nav' });
+
+    // Scrim for "More" overlay
+    const scrim = el('div', { class: 'mobile-more-scrim', id: 'mobile-more-scrim' });
+    const moreOverlay = el('div', { class: 'mobile-more-overlay', id: 'mobile-more-overlay' });
+
+    function closeMore() {
+      moreOverlay.classList.remove('open');
+      scrim.classList.remove('open');
+      const moreBtn = document.getElementById('mobile-nav-more');
+      if (moreBtn) moreBtn.classList.remove('active');
+    }
+    scrim.addEventListener('click', closeMore);
+
+    SECONDARY.forEach(item => {
+      const row = el('div', { class: 'mobile-more-item' },
+        el('span', { class: 'mobile-more-icon' }, item.icon),
+        item.label
+      );
+      row.addEventListener('click', () => {
+        closeMore();
+        navigate(item.id);
+      });
+      moreOverlay.appendChild(row);
+    });
+
+    document.body.appendChild(scrim);
+    document.body.appendChild(moreOverlay);
+
+    // Primary items
+    PRIMARY.forEach(item => {
+      const btn = el('button', {
+        class: 'mobile-nav-item',
+        id: `mobile-nav-${item.id}`,
+        type: 'button',
+      },
+        el('span', { class: 'mobile-nav-icon' }, item.icon),
+        item.label
+      );
+      btn.addEventListener('click', () => {
+        closeMore();
+        navigate(item.id);
+      });
+      nav.appendChild(btn);
+    });
+
+    // "More" button
+    const moreBtn = el('button', {
+      class: 'mobile-nav-item',
+      id: 'mobile-nav-more',
+      type: 'button',
+    },
+      el('span', { class: 'mobile-nav-icon' }, '···'),
+      'More'
+    );
+    moreBtn.addEventListener('click', () => {
+      const open = moreOverlay.classList.toggle('open');
+      scrim.classList.toggle('open', open);
+      moreBtn.classList.toggle('active', open);
+    });
+    nav.appendChild(moreBtn);
+
+    return nav;
+  }
+
+  /* ── Sync mobile nav active state ───────────────────────────── */
+  function _syncMobileNav(moduleId) {
+    $$('.mobile-nav-item').forEach(btn => btn.classList.remove('active'));
+    const mobileBtn = document.getElementById(`mobile-nav-${moduleId}`);
+    if (mobileBtn) mobileBtn.classList.add('active');
+  }
+
   function renderShell() {
     document.body.innerHTML = '';
 
@@ -104,7 +199,11 @@ const App = (() => {
     // Notification area
     const notifArea = el('div', { class: 'notif-area', id: 'notif-area' });
 
-    document.body.append(topbar, sidebar, workspace, statusbar, notifArea);
+    // ── Mobile Bottom Navigation ─────────────────────────────────
+    // Rendered into DOM always; CSS hides it on desktop (≥768px).
+    const mobileNav = _buildMobileNav();
+
+    document.body.append(topbar, sidebar, workspace, statusbar, notifArea, mobileNav);
 
     // Init sub-modules
     Output.init(null);  // Will be set when navigating to output
@@ -122,6 +221,9 @@ const App = (() => {
     const navEl = document.getElementById(`nav-${moduleId}`);
     if (navEl) navEl.classList.add('active');
 
+    // Sync mobile bottom nav active state
+    _syncMobileNav(moduleId);
+
     const workspace = document.getElementById('workspace');
     if (!workspace) return;
     workspace.innerHTML = '';
@@ -133,13 +235,59 @@ const App = (() => {
       case 'analyze':   renderAnalyzeModule(workspace); break;
       case 'graphs':    GraphsModule.init(workspace); GraphsModule.render(); break;
       case 'syntax':    SyntaxEditor.init(workspace); SyntaxEditor.render(); break;
-      case 'output':    Output.init(workspace); Output.render(); break;
+      case 'output':    Output.init(workspace); _patchOutputForMobile(); break;
       case 'history':   History.init(workspace); History.render(); break;
       case 'ai':        AIAssistant.init(workspace); AIAssistant.render(); break;
       case 'settings':  renderSettings(workspace); break;
       case 'help':      renderHelpModule(workspace); break;
     }
     updateStatusBar();
+  }
+
+  /* ── Output history drawer for mobile ───────────────────────── */
+  function _patchOutputForMobile() {
+    // First render the output module normally
+    Output.render();
+    // Then, on mobile, inject the "Output History" toggle button and scrim
+    if (window.innerWidth >= 768) return;
+    const tree = document.querySelector('.output-tree');
+    const content = document.querySelector('.output-content');
+    if (!tree || !content) return;
+
+    // Inject "Output History" toggle button at top of content area
+    const existingBtn = content.querySelector('.mobile-output-history-btn');
+    if (!existingBtn) {
+      const toggleBtn = el('button', {
+        class: 'mobile-output-history-btn',
+        type: 'button',
+      }, '📋 Output History ▲');
+
+      // Build and inject a scrim element for the drawer
+      let scrim = document.getElementById('output-tree-scrim');
+      if (!scrim) {
+        scrim = el('div', { class: 'output-tree-scrim', id: 'output-tree-scrim' });
+        document.body.appendChild(scrim);
+      }
+
+      function openDrawer() {
+        tree.classList.add('mobile-drawer-open');
+        scrim.classList.add('open');
+        toggleBtn.textContent = '📋 Output History ▼';
+      }
+      function closeDrawer() {
+        tree.classList.remove('mobile-drawer-open');
+        scrim.classList.remove('open');
+        toggleBtn.textContent = '📋 Output History ▲';
+      }
+
+      toggleBtn.addEventListener('click', () => {
+        if (tree.classList.contains('mobile-drawer-open')) closeDrawer();
+        else openDrawer();
+      });
+      scrim.addEventListener('click', closeDrawer);
+
+      content.insertBefore(toggleBtn, content.firstChild);
+    }
   }
 
   // Expose navigate for modules that need it (AIAssistant action system, GraphsModule empty state)

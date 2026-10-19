@@ -145,6 +145,107 @@ const AnalysisDialogs = (() => {
     return box;
   }
 
+  /**
+   * Wraps varList() with a mobile-friendly toolbar:
+   *   [Select All Compatible]  [Clear]  — N selected
+   *
+   * The toolbar is sticky inside the dialog body so it stays visible
+   * while the variable list scrolls.
+   *
+   * Parameters are identical to varList() plus:
+   *   countLabel — short label for the selection counter, e.g. 'items'
+   *
+   * Returns a <div class="var-list-wrap"> containing toolbar + list.
+   */
+  function varListWithToolbar(dataset, selected, multi=true, onChange, filterFn, procedure, role, countLabel='variables') {
+    const wrap = el('div', { class: 'var-list-wrap' });
+
+    // Build eligibility data to determine how many are eligible
+    let eligibleCount = 0;
+    let eligMap = null;
+    if (procedure && typeof AnalysisEligibility !== 'undefined') {
+      const list = AnalysisEligibility.getEligibleVariables(dataset, procedure, role || 'any');
+      eligMap = new Map(list.map(e => [e.varDef.name, e]));
+      eligibleCount = list.filter(e => e.eligible).length;
+    } else {
+      const allVis = dataset.variables.filter(v => v.visibility !== false);
+      eligibleCount = filterFn ? allVis.filter(filterFn).length : allVis.length;
+    }
+
+    // Selection count label element (updated on every onChange)
+    const countEl = el('span', { class: 'var-list-count' }, `0 of ${eligibleCount} selected`);
+
+    function updateCount() {
+      countEl.textContent = `${selected.length} of ${eligibleCount} selected`;
+    }
+
+    // Wrapped onChange that also updates the count
+    const wrappedOnChange = (sel) => {
+      updateCount();
+      onChange && onChange(sel);
+    };
+
+    const listEl = varList(dataset, selected, multi, wrappedOnChange, filterFn, procedure, role);
+
+    // Select All Compatible button
+    const selectAllBtn = el('button', {
+      class: 'btn btn-sm',
+      type: 'button',
+      title: 'Select all eligible variables (Ctrl+A)',
+      disabled: eligibleCount === 0,
+    }, 'Select All Compatible');
+
+    selectAllBtn.addEventListener('click', () => {
+      // Trigger the same Ctrl+A logic by dispatching a synthetic keyboard event
+      // to the listEl, OR simply replicate the selection logic here
+      const allVis = dataset.variables.filter(v => v.visibility !== false);
+      const eligible = eligMap
+        ? allVis.filter(v => eligMap.get(v.name)?.eligible !== false)
+        : (filterFn ? allVis.filter(filterFn) : allVis);
+      eligible.forEach(v => { if (!selected.includes(v.name)) selected.push(v.name); });
+      // Update all var-items in the list
+      listEl.querySelectorAll('.var-item[data-eligible="1"]').forEach(it => {
+        it.classList.add('selected');
+        const chk = it.querySelector('.var-item-chk');
+        if (chk) chk.textContent = '✓';
+      });
+      updateCount();
+      onChange && onChange([...selected]);
+    });
+
+    // Clear Selection button
+    const clearBtn = el('button', {
+      class: 'btn btn-sm',
+      type: 'button',
+      title: 'Clear all selections',
+    }, 'Clear');
+
+    clearBtn.addEventListener('click', () => {
+      selected.length = 0;
+      listEl.querySelectorAll('.var-item').forEach(it => {
+        it.classList.remove('selected');
+        const chk = it.querySelector('.var-item-chk');
+        if (chk) chk.textContent = '';
+      });
+      updateCount();
+      onChange && onChange([]);
+    });
+
+    // Only show toolbar when multi-select is enabled
+    if (multi) {
+      const toolbar = el('div', { class: 'var-list-toolbar' },
+        selectAllBtn,
+        clearBtn,
+        countEl
+      );
+      wrap.appendChild(toolbar);
+    }
+
+    wrap.appendChild(listEl);
+    updateCount();
+    return wrap;
+  }
+
   // WHY_PANELS: contextual explanations for each procedure
   const WHY_PANELS = {
     'Frequencies':               { why: 'Shows how often each value appears. Use for categorical or nominal variables to understand distribution.', when: 'Any variable — start here to understand your data.', alt: null },
@@ -207,7 +308,7 @@ const AnalysisDialogs = (() => {
     const body=el('div',{class:'analysis-form'},
       el('div',{class:'form-section'},
         el('label',{},'Variables:'),
-        varList(ds,sel,true,()=>{},null,'frequencies')
+        varListWithToolbar(ds,sel,true,()=>{},null,'frequencies')
       )
     );
     mkDialog('Frequencies',body,()=>{
@@ -223,7 +324,7 @@ const AnalysisDialogs = (() => {
     const body=el('div',{class:'analysis-form'},
       el('div',{class:'form-section'},
         el('label',{},'Variables (numeric/scale):'),
-        varList(ds,sel,true,()=>{},null,'descriptives')
+        varListWithToolbar(ds,sel,true,()=>{},null,'descriptives')
       )
     );
     mkDialog('Descriptives',body,()=>{
@@ -267,7 +368,7 @@ const AnalysisDialogs = (() => {
       el('option',{value:'kendall'},'Kendall\'s tau')
     );
     const body=el('div',{class:'analysis-form'},
-      el('div',{class:'form-section'},el('label',{},'Variables:'),varList(ds,sel,true,()=>{},null,'correlation')),
+      el('div',{class:'form-section'},el('label',{},'Variables:'),varListWithToolbar(ds,sel,true,()=>{},null,'correlation')),
       el('div',{class:'form-row'},el('label',{},'Method: '),methodSel)
     );
     mkDialog('Bivariate Correlations',body,()=>{
@@ -339,7 +440,7 @@ const AnalysisDialogs = (() => {
       el('option',{value:'scheffe'},'Scheffé')
     );
     const body=el('div',{class:'analysis-form two-col'},
-      el('div',{class:'form-section'},el('label',{},'Dependent variable(s):'),varList(ds,depVars,true,()=>{},null,'anova_oneway','dependent')),
+      el('div',{class:'form-section'},el('label',{},'Dependent variable(s):'),varListWithToolbar(ds,depVars,true,()=>{},null,'anova_oneway','dependent')),
       el('div',{class:'form-section'},el('label',{},'Factor:'),varList(ds,factorVar,false,()=>{},null,'anova_oneway','independent')),
       el('div',{class:'form-row'},el('label',{},'Post Hoc: '),postHocSel)
     );
@@ -381,7 +482,7 @@ const AnalysisDialogs = (() => {
       depCountLbl.textContent=depVar.length?`${depVar[0]} selected`:'';
     },_isNumericCompat,'linear_regression','dependent');
 
-    const indepList=varList(ds,indepVars,true,()=>{
+    const indepList=varListWithToolbar(ds,indepVars,true,()=>{
       indepCountLbl.textContent=indepVars.length?`${indepVars.length} selected`:'';
     },_isNumericCompat,'linear_regression','independent');
 
@@ -421,7 +522,7 @@ const AnalysisDialogs = (() => {
     const depVar=[],covariates=[];
     const body=el('div',{class:'analysis-form two-col'},
       el('div',{class:'form-section'},el('label',{},'Dependent variable (binary):'),varList(ds,depVar,false,()=>{},null,'logistic_regression','dependent')),
-      el('div',{class:'form-section'},el('label',{},'Covariates:'),varList(ds,covariates,true,()=>{},null,'logistic_regression','independent'))
+      el('div',{class:'form-section'},el('label',{},'Covariates:'),varListWithToolbar(ds,covariates,true,()=>{},null,'logistic_regression','independent'))
     );
     mkDialog('Binary Logistic Regression',body,()=>{
       if(!depVar[0]||!covariates.length){notify('Select dependent variable and covariates','warning');return false;}
@@ -434,7 +535,7 @@ const AnalysisDialogs = (() => {
     const ds=getDataset(); if(!ds){notify('No dataset loaded','error');return;}
     const sel=[];
     const body=el('div',{class:'analysis-form'},
-      el('div',{class:'form-section'},el('label',{},'Items (scale variables):'),varList(ds,sel,true,()=>{},null,'reliability','item'))
+      el('div',{class:'form-section'},el('label',{},'Items (scale variables):'),varListWithToolbar(ds,sel,true,()=>{},null,'reliability','item','items'))
     );
     mkDialog('Reliability Analysis (Cronbach\'s α)',body,()=>{
       if(sel.length<2){notify('Select at least 2 items','warning');return false;}
@@ -455,7 +556,7 @@ const AnalysisDialogs = (() => {
       el('option',{value:'paf'},'Principal Axis Factoring')
     );
     const body=el('div',{class:'analysis-form'},
-      el('div',{class:'form-section'},el('label',{},'Variables:'),varList(ds,sel,true,()=>{},null,'factor_analysis')),
+      el('div',{class:'form-section'},el('label',{},'Variables:'),varListWithToolbar(ds,sel,true,()=>{},null,'factor_analysis')),
       el('div',{class:'form-row'},el('label',{},'Extraction: '),extSel),
       el('div',{class:'form-row'},el('label',{},'Rotation: '),rotSel)
     );
@@ -487,7 +588,7 @@ const AnalysisDialogs = (() => {
         formBox.appendChild(el('label',{},'Variable 1:')); formBox.appendChild(varList(ds,var1,false,()=>{},null,'nonparametric_wilcoxon'));
         formBox.appendChild(el('label',{},'Variable 2:')); formBox.appendChild(varList(ds,var2,false,()=>{},null,'nonparametric_wilcoxon'));
       } else if(t==='friedman'){
-        formBox.appendChild(el('label',{},'Variables (repeated measures):')); formBox.appendChild(varList(ds,var1,true,()=>{},null,'nonparametric_friedman'));
+        formBox.appendChild(el('label',{},'Variables (repeated measures):')); formBox.appendChild(varListWithToolbar(ds,var1,true,()=>{},null,'nonparametric_friedman'));
       }
     }
     renderNPForm();
@@ -525,7 +626,7 @@ const AnalysisDialogs = (() => {
     const sel=[];
     const kInp=el('input',{type:'number',class:'form-control',value:'3',min:'2',max:'20'});
     const body=el('div',{class:'analysis-form'},
-      el('div',{class:'form-section'},el('label',{},'Variables:'),varList(ds,sel,true,()=>{},null,'kmeans')),
+      el('div',{class:'form-section'},el('label',{},'Variables:'),varListWithToolbar(ds,sel,true,()=>{},null,'kmeans')),
       el('div',{class:'form-row'},el('label',{},'Number of clusters (k): '),kInp)
     );
     mkDialog('K-Means Cluster Analysis',body,()=>{

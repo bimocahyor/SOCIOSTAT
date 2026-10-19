@@ -1,0 +1,469 @@
+/* ════════════════════════════════════════════════════════════════════
+   SOCIOSTAT — Responsive / Mobile stylesheet
+   Load order: after all other stylesheets (last in <head>)
+
+   Breakpoints:
+     --mobile-sm  : 320–359 px
+     --mobile     : 360–430 px
+     --mobile-lg  : 431–767 px
+     --tablet     : 768–1023 px
+     --desktop    : 1024 px +  (no overrides needed — base CSS targets this)
+
+   Strategy:
+     • Desktop layout is unchanged.
+     • ≤ 767 px: hide sidebar, show fixed bottom nav, collapse output-tree
+       into a slide-up drawer, make tables overflow within their own wrappers,
+       and add Select-All/Clear toolbars to variable-list dialogs.
+   ════════════════════════════════════════════════════════════════════ */
+
+/* ── Mobile custom properties ──────────────────────────────────── */
+:root {
+  --mobile-bottom-nav:  54px;
+  --mobile-header:      44px; /* same as --topbar on desktop */
+}
+
+/* ════════════════════════════════════════════════════════════════
+   TABLET + MOBILE  (≤ 1023 px)
+   ════════════════════════════════════════════════════════════════ */
+@media (max-width: 1023px) {
+
+  /* Collapse the sidebar completely — bottom nav handles navigation */
+  .sidebar {
+    display: none !important;
+  }
+
+  /* Body grid: topbar | workspace | statusbar, full width */
+  body {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "topbar"
+      "workspace"
+      "statusbar";
+  }
+
+  /* Topbar: shrink the search button on small screens */
+  .topbar-search-btn {
+    min-width: unset;
+    font-size: 0;        /* hide text label */
+    padding: 5px 8px;
+  }
+  .topbar-search-btn::before {
+    content: '🔍';
+    font-size: 15px;
+  }
+  .topbar-search-kbd { display: none; }
+
+  /* Mode toggle: hide text labels, keep buttons */
+  .mode-btn { font-size: 0; padding: 4px 8px; }
+  .mode-btn::before { font-size: 11px; }
+  #mode-btn-simple::before { content: '🎓'; }
+  #mode-btn-pro::before    { content: '⚡'; }
+
+  /* Topbar actions: stack Save / Import iconically */
+  .topbar-actions .btn { font-size: 0; padding: 4px 8px; }
+  .topbar-actions .btn:nth-child(1)::before { content: '+'; font-size: 13px; }
+  .topbar-actions .btn:nth-child(2)::before { content: '💾'; font-size: 14px; }
+  .topbar-actions .btn:nth-child(3)::before { content: '📥'; font-size: 14px; }
+  .topbar-actions .btn:nth-child(4)::before { content: '📤'; font-size: 14px; }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   MOBILE  (≤ 767 px)
+   ════════════════════════════════════════════════════════════════ */
+@media (max-width: 767px) {
+
+  /* ── Body: reserve bottom nav space ──────────────────────────── */
+  body {
+    grid-template-rows: var(--topbar) 1fr var(--status-bar);
+    /* Extra bottom padding handled via workspace padding-bottom */
+  }
+
+  /* ── Workspace: don't let content bleed under bottom nav ─────── */
+  .workspace {
+    padding-bottom: var(--mobile-bottom-nav);
+    /* Use dynamic viewport height to avoid mobile browser chrome overlap */
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* ── Status bar: hide on mobile (redundant info, wastes space) ── */
+  .statusbar { display: none !important; }
+  body {
+    grid-template-rows: var(--topbar) 1fr 0;
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+     MOBILE BOTTOM NAVIGATION
+     Fixed to the bottom of the viewport. Each item calls the
+     existing App.navigate() function via onclick.
+  ─────────────────────────────────────────────────────────────── */
+  .mobile-bottom-nav {
+    display: flex !important;
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    height: var(--mobile-bottom-nav);
+    background: #141820;
+    border-top: 1px solid rgba(255,255,255,0.08);
+    z-index: 500;
+    align-items: stretch;
+    /* Respect device safe area (notched phones) */
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .mobile-nav-item {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    cursor: pointer;
+    color: rgba(255,255,255,0.45);
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    padding: 6px 4px;
+    border: none;
+    background: none;
+    transition: color 0.12s, background 0.12s;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    min-height: 44px; /* WCAG touch target */
+  }
+
+  .mobile-nav-item:active,
+  .mobile-nav-item.active {
+    color: #fff;
+    background: rgba(37,99,235,0.2);
+  }
+
+  .mobile-nav-item .mobile-nav-icon {
+    font-size: 18px;
+    line-height: 1;
+  }
+
+  /* "More" dropdown overlay */
+  .mobile-more-overlay {
+    display: none;
+    position: fixed;
+    bottom: var(--mobile-bottom-nav);
+    left: 0; right: 0;
+    background: #1a1f2e;
+    border-top: 1px solid rgba(255,255,255,0.10);
+    z-index: 499;
+    padding: 8px 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    animation: slideUpFade 0.18s ease;
+  }
+
+  .mobile-more-overlay.open { display: block; }
+
+  @keyframes slideUpFade {
+    from { transform: translateY(12px); opacity: 0; }
+    to   { transform: translateY(0);    opacity: 1; }
+  }
+
+  .mobile-more-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 20px;
+    color: rgba(255,255,255,0.70);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.1s;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .mobile-more-item:active {
+    background: rgba(37,99,235,0.18);
+    color: #fff;
+  }
+
+  .mobile-more-item .mobile-more-icon { font-size: 17px; width: 24px; text-align: center; }
+
+  /* Scrim — tapping it closes the More menu */
+  .mobile-more-scrim {
+    display: none;
+    position: fixed;
+    inset: 0;
+    bottom: calc(var(--mobile-bottom-nav) + 1px);
+    background: rgba(0,0,0,0.35);
+    z-index: 498;
+  }
+  .mobile-more-scrim.open { display: block; }
+
+  /* ── Home screen: compact hero ───────────────────────────────── */
+  .home-hero {
+    padding: 20px 18px 16px;
+  }
+  .home-title { font-size: 22px; }
+  .home-tagline { font-size: 12px; margin-bottom: 14px; }
+  .home-body { padding: 14px 14px; }
+  .action-grid { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
+
+  /* ────────────────────────────────────────────────────────────────
+     OUTPUT VIEWER — mobile: Output tree becomes a slide-up drawer
+  ─────────────────────────────────────────────────────────────── */
+
+  /* The existing .output-split wraps .output-tree + .output-content */
+  .output-split {
+    flex-direction: column !important;
+    position: relative;
+  }
+
+  /* Content takes full width */
+  .output-content {
+    width: 100% !important;
+    flex: 1 !important;
+    padding: 12px 10px !important;
+  }
+
+  /* Tree becomes a fixed overlay drawer that slides up from the bottom */
+  .output-tree {
+    position: fixed !important;
+    bottom: var(--mobile-bottom-nav) !important;
+    left: 0 !important; right: 0 !important;
+    width: 100% !important;
+    max-height: 55vh !important;
+    border-right: none !important;
+    border-top: 1px solid var(--border-solid) !important;
+    background: var(--surface-solid) !important;
+    z-index: 400 !important;
+    transform: translateY(100%) !important;
+    transition: transform 0.22s ease !important;
+    overflow-y: auto !important;
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0 !important;
+    box-shadow: 0 -4px 24px rgba(0,0,0,0.18) !important;
+    padding-bottom: env(safe-area-inset-bottom, 0px) !important;
+  }
+
+  .output-tree.mobile-drawer-open {
+    transform: translateY(0) !important;
+  }
+
+  /* Mobile output toolbar — add a History toggle button */
+  .output-toolbar {
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 6px 8px;
+  }
+
+  .output-toolbar .btn {
+    font-size: 11px;
+    padding: 4px 7px;
+  }
+
+  /* Floating "History" toggle button (injected by JS) */
+  .mobile-output-history-btn {
+    display: flex !important;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    width: 100%;
+    padding: 8px 12px;
+    background: var(--surface-solid);
+    border-bottom: 1px solid var(--border-solid);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    cursor: pointer;
+    align-items: center;
+    gap: 6px;
+    border: none;
+    text-align: left;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Scrim behind drawer */
+  .output-tree-scrim {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.35);
+    z-index: 399;
+  }
+  .output-tree-scrim.open { display: block; }
+
+  /* ────────────────────────────────────────────────────────────────
+     RESPONSIVE TABLES
+     Wide statistical tables scroll horizontally within their own
+     wrapper. The page itself does not scroll sideways.
+  ─────────────────────────────────────────────────────────────── */
+
+  .pivot-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    max-width: 100%;
+    margin-bottom: 14px;
+  }
+
+  /* Prevent the pivot table from forcing page-wide overflow */
+  .output-content {
+    overflow-x: hidden; /* page-level horizontal scroll disabled */
+  }
+
+  .pivot-table {
+    font-size: 11px;
+  }
+
+  .pivot-table th,
+  .pivot-table td {
+    padding: 5px 8px;
+    white-space: nowrap;
+  }
+
+  /* First column sticky in wide tables — keeps row labels visible */
+  .pivot-table th:first-child,
+  .pivot-table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: #1e2232; /* matches header bg */
+  }
+  .pivot-table tbody td:first-child {
+    background: var(--surface-solid);
+  }
+
+  /* Warning/assumption boxes: full width */
+  .warning-box { max-width: 100%; }
+
+  /* Graph/chart: fill available width */
+  .graph-chart {
+    height: 260px !important;
+    width: 100% !important;
+  }
+
+  /* Graph output toolbar: wrap */
+  .graph-canvas-area .data-toolbar {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+     ANALYSIS DIALOGS
+  ─────────────────────────────────────────────────────────────── */
+
+  .dialog-overlay {
+    padding: 0;
+    align-items: flex-end; /* sheet slides up from bottom */
+  }
+
+  .dialog-box {
+    width: 100%;
+    max-width: 100%;
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    max-height: 92dvh;
+    min-width: unset;
+    /* Safe area for home-indicator phones */
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .analysis-form.two-col {
+    grid-template-columns: 1fr; /* single column on mobile */
+  }
+
+  .analysis-form.two-col .wide {
+    grid-column: span 1;
+  }
+
+  /* Variable list: taller touch targets */
+  .var-item {
+    padding: 9px 12px;
+    min-height: 44px;
+  }
+
+  /* Selection toolbar (injected by JS) */
+  .var-list-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    background: var(--surface-solid);
+    border-bottom: 1px solid var(--border-solid);
+    flex-wrap: wrap;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    flex-shrink: 0;
+  }
+
+  .var-list-toolbar .btn {
+    min-height: 36px;
+    font-size: 12px;
+  }
+
+  .var-list-count {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-left: auto;
+  }
+
+  .var-list-wrap {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  /* Dialog footer buttons: large touch targets */
+  .dialog-footer .btn {
+    min-height: 44px;
+    font-size: 13px;
+    flex: 1;
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+     DATA VIEW
+  ─────────────────────────────────────────────────────────────── */
+  .data-kb-hint { display: none; } /* hide keyboard hints on touch */
+  .data-grid td  { padding: 4px 6px; }
+  .data-grid th  { padding: 4px 6px; font-size: 10px; }
+
+  /* ────────────────────────────────────────────────────────────────
+     GENERAL UTILITY
+  ─────────────────────────────────────────────────────────────── */
+
+  /* Ensure all direct workspace children respect width */
+  .workspace > * {
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  /* Full-width result containers */
+  .output-content > * {
+    max-width: 100%;
+    min-width: 0;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   SMALL PHONES  (≤ 359 px)
+   ════════════════════════════════════════════════════════════════ */
+@media (max-width: 359px) {
+  .home-title { font-size: 18px; }
+  .action-grid { grid-template-columns: 1fr 1fr; gap: 6px; }
+  .mobile-nav-item { font-size: 8px; }
+  .mobile-nav-item .mobile-nav-icon { font-size: 16px; }
+  .pivot-table { font-size: 10px; }
+  .dialog-box { max-height: 96dvh; }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Desktop guard — ensure mobile-only elements are hidden on desktop
+   ════════════════════════════════════════════════════════════════ */
+@media (min-width: 768px) {
+  .mobile-bottom-nav   { display: none !important; }
+  .mobile-more-overlay { display: none !important; }
+  .mobile-more-scrim   { display: none !important; }
+  .output-tree-scrim   { display: none !important; }
+
+  /* Reset output-tree to desktop state */
+  .output-tree {
+    position: static !important;
+    transform: none !important;
+    max-height: none !important;
+    width: 224px !important;
+  }
+}
