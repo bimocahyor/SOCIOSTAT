@@ -72,25 +72,54 @@
    ════════════════════════════════════════════════════════════════ */
 @media (max-width: 767px) {
 
-  /* ── Body: reserve bottom nav space ──────────────────────────── */
+  /* ── Body: 3-row grid — topbar / workspace / nothing.
+     Use 100dvh with 100vh fallback so the grid fits the
+     actual visible viewport on Android/iOS (URL bar included). ── */
   body {
-    grid-template-rows: var(--topbar) 1fr var(--status-bar);
-    /* Extra bottom padding handled via workspace padding-bottom */
-  }
-
-  /* ── Workspace: don't let content bleed under bottom nav ─────── */
-  .workspace {
-    padding-bottom: var(--mobile-bottom-nav);
-    /* Use dynamic viewport height to avoid mobile browser chrome overlap */
-    overflow-y: auto;
-    -webkit-overflow-scrolling: touch;
+    height: 100vh;          /* fallback for browsers without dvh */
+    height: 100dvh;         /* dynamic viewport — excludes browser chrome */
+    overflow: hidden;       /* body must NOT scroll — workspace scrolls */
+    grid-template-rows: var(--topbar) 1fr 0;
   }
 
   /* ── Status bar: hide on mobile (redundant info, wastes space) ── */
   .statusbar { display: none !important; }
-  body {
-    grid-template-rows: var(--topbar) 1fr 0;
+
+  /* ── Workspace: independently scrollable content area.
+     overflow:hidden prevents workspace from growing taller than
+     its grid row, which would allow workspace to scroll and
+     visually "hide" the topbar above the fold.
+     The inner .data-content handles its own overflow.         ── */
+  .workspace {
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    /* Reserve space at bottom so bottom nav never covers last row */
+    padding-bottom: 0;
   }
+
+  /* ── Scrollable workspace children: reserve space for bottom nav ── */
+  /* data-content, home-screen, analyze-workspace, settings-workspace,
+     transform-workspace, help-workspace — all use overflow scroll and
+     need padding so bottom nav doesn't cover content.               */
+  .data-content,
+  .home-screen,
+  .analyze-workspace,
+  .settings-workspace,
+  .transform-workspace {
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: var(--mobile-bottom-nav);
+    min-height: 0;
+  }
+
+  /* data-content also needs flex: 1 to fill remaining tab-bar space */
+  .data-content {
+    flex: 1;
+  }
+
+  /* Help workspace is flex — needs padding on its scrollable inner parts */
+  .help-workspace { padding-bottom: var(--mobile-bottom-nav); }
 
   /* ────────────────────────────────────────────────────────────────
      MOBILE BOTTOM NAVIGATION

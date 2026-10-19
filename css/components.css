@@ -174,7 +174,7 @@ select.form-control { cursor: pointer; }
 }
 .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
 .tab-btn:hover:not(.active) { color: var(--text); }
-.data-content { flex: 1; overflow: auto; }
+.data-content { flex: 1; overflow: auto; min-height: 0; }
 .data-toolbar {
   display: flex; align-items: center; gap: 7px;
   padding: 6px 10px; background: var(--surface-solid);

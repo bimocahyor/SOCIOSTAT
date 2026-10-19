@@ -418,7 +418,7 @@ const DataView = (() => {
     _dataset=dataset;
     if (!_container) return;
     _container.innerHTML='';
-    _container.style.cssText='display:flex;flex-direction:column;height:100%;';
+    _container.style.cssText='display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;';
     _tdMap=new Map(); _trMap=new Map();
 
     if (!dataset) {

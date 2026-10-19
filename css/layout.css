@@ -1,4 +1,4 @@
-﻿/* â”€â”€â”€ Splash Screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* â”€â”€â”€ Splash Screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 #app { height: 100%; display: flex; align-items: center; justify-content: center; }
 .splash { text-align: center; padding: 40px; max-width: 380px; width: 100%; }
 .splash-logo { font-size: 32px; font-weight: 900; letter-spacing: 1px; color: #2563eb; margin-bottom: 8px; }
@@ -137,9 +137,11 @@ body {
 /* â”€â”€â”€ Workspace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .workspace {
   grid-area: workspace;
-  overflow: auto; background: var(--bg);
+  overflow: hidden;           /* workspace must NOT scroll — inner containers do */
+  background: var(--bg);
   display: flex; flex-direction: column;
   min-width: 0;
+  min-height: 0;              /* required: grid item with flex children */
 }
 
 /* â”€â”€â”€ Status Bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
