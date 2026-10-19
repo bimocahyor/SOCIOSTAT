@@ -703,8 +703,18 @@ const StatProcs = (() => {
      RELIABILITY (Cronbach's Alpha)
      ══════════════════════════════════════════════════════════════ */
   function reliability(dataset, params) {
-    const { items } = params;
-    if (!items||items.length<2) return _err('reliability','INSUFFICIENT_ITEMS','At least 2 items required.','','');
+    // Normalize items to dataset variable order (local copy — do not mutate caller's array).
+    // Variables not found in dataset.variables are kept at the end in their original order.
+    const _rawItems = params.items;
+    if (!_rawItems||_rawItems.length<2) return _err('reliability','INSUFFICIENT_ITEMS','At least 2 items required.','','');
+    const items = _rawItems.slice().sort((a, b) => {
+      const ia = dataset.variables.findIndex(v => v.name === a);
+      const ib = dataset.variables.findIndex(v => v.name === b);
+      // Unknown variables (-1) sort to the end
+      const sa = ia === -1 ? Infinity : ia;
+      const sb = ib === -1 ? Infinity : ib;
+      return sa - sb;
+    });
     const { data, warnings } = resolveDataset(dataset,items,params);
     const cols=items.map(it=>(data[it]||[]).filter(v=>typeof v==='number'&&isFinite(v)));
     const n=Math.min(...cols.map(c=>c.length));

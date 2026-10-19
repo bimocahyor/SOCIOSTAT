@@ -117,7 +117,38 @@ select.form-control { cursor: pointer; }
 .why-panel p { color: var(--text-secondary); line-height: 1.6; margin-bottom: 4px; }
 .why-panel .alt { color: var(--text-muted); font-size: 11px; }
 
-/* â”€â”€â”€ Variable Selector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* â"€â"€â"€ Variable Selector â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€ */
+
+/* Wrapper that holds the toolbar + the scrollable list */
+.var-list-wrap {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Sticky toolbar above the var-list (desktop + mobile) */
+.var-list-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--surface-solid, #f7f8fa);
+  border-bottom: 1px solid var(--border-solid, #e5e7eb);
+  flex-wrap: wrap;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex-shrink: 0;
+}
+
+.var-list-toolbar .btn { font-size: 12px; }
+
+.var-list-count {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
 .var-list { border: 1px solid var(--border-solid); border-radius: var(--radius-md); overflow-y: auto; max-height: 180px; background: var(--bg-white); }
 .var-item {
   display: flex; align-items: center; gap: 7px;

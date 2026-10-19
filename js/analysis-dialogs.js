@@ -1,4 +1,38 @@
 const AnalysisDialogs = (() => {
+
+  /**
+   * Shared "select all eligible" logic used by BOTH Ctrl+A in varList()
+   * and the toolbar button in varListWithToolbar().
+   *
+   * @param {Map|null}  eligMap   — Map<varName, {eligible, …}> or null
+   * @param {Function|null} filterFn — optional extra predicate
+   * @param {object}    dataset   — active dataset
+   * @param {string[]}  selected  — mutable selected array (mutated in place)
+   * @param {Element}   listEl    — the .var-list DOM element to update
+   * @param {Function}  updateCount — callback to refresh the count label (may be null)
+   * @param {Function}  onChange  — called with [...selected] when done
+   */
+  function _selectAllEligible(eligMap, filterFn, dataset, selected, listEl, updateCount, onChange) {
+    const allVis = dataset.variables.filter(v => v.visibility !== false);
+    let eligible;
+    if (eligMap) {
+      // Use ONLY variables explicitly marked eligible:true in the map
+      eligible = allVis.filter(v => eligMap.get(v.name)?.eligible === true);
+    } else {
+      eligible = filterFn ? allVis.filter(filterFn) : allVis;
+    }
+    const scrollTop = listEl.scrollTop;
+    eligible.forEach(v => { if (!selected.includes(v.name)) selected.push(v.name); });
+    listEl.querySelectorAll('.var-item[data-eligible="1"]').forEach(it => {
+      it.classList.add('selected');
+      const chk = it.querySelector('.var-item-chk');
+      if (chk) chk.textContent = '✓';
+    });
+    listEl.scrollTop = scrollTop;
+    updateCount && updateCount();
+    onChange && onChange([...selected]);
+  }
+
   /**
    * Variable list picker — in-place DOM updates, scroll and focus preserved.
    *
@@ -104,15 +138,11 @@ const AnalysisDialogs = (() => {
       box.appendChild(item);
     });
 
-    // Ctrl+A / Cmd+A — select all ELIGIBLE variables only
+    // Ctrl+A / Cmd+A — select all ELIGIBLE variables only (shared logic)
     box.addEventListener('keydown',e=>{
       if (multi && (e.ctrlKey||e.metaKey) && (e.key==='a'||e.key==='A')) {
         e.preventDefault();
-        const scrollTop=box.scrollTop;
-        eligibleVars.forEach(v=>{ if(!selected.includes(v.name)) selected.push(v.name); });
-        $$('.var-item',box).forEach(it=>{ _updateItemEl(it,it.dataset.vn); });
-        box.scrollTop=scrollTop;
-        onChange && onChange([...selected]);
+        _selectAllEligible(eligMap, filterFn, dataset, selected, box, null, onChange);
       }
     });
 
@@ -196,21 +226,8 @@ const AnalysisDialogs = (() => {
     }, 'Select All Compatible');
 
     selectAllBtn.addEventListener('click', () => {
-      // Trigger the same Ctrl+A logic by dispatching a synthetic keyboard event
-      // to the listEl, OR simply replicate the selection logic here
-      const allVis = dataset.variables.filter(v => v.visibility !== false);
-      const eligible = eligMap
-        ? allVis.filter(v => eligMap.get(v.name)?.eligible !== false)
-        : (filterFn ? allVis.filter(filterFn) : allVis);
-      eligible.forEach(v => { if (!selected.includes(v.name)) selected.push(v.name); });
-      // Update all var-items in the list
-      listEl.querySelectorAll('.var-item[data-eligible="1"]').forEach(it => {
-        it.classList.add('selected');
-        const chk = it.querySelector('.var-item-chk');
-        if (chk) chk.textContent = '✓';
-      });
-      updateCount();
-      onChange && onChange([...selected]);
+      // Pass null for updateCount — wrappedOnChange calls it already.
+      _selectAllEligible(eligMap, filterFn, dataset, selected, listEl, null, wrappedOnChange);
     });
 
     // Clear Selection button
