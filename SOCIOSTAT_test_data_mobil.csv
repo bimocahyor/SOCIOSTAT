@@ -1,0 +1,101 @@
+id,jenis_mobil,merek,model,tahun,harga_usd,kapasitas_penumpang,tenaga_hp,berat_kg,kelas,transmisi
+1,SUV,Toyota,Fortuner,2022,42000,7,163,1920,premium,otomatis
+2,MPV,Toyota,Innova,2021,28000,8,136,1855,menengah,otomatis
+3,Sedan,Honda,Civic,2023,24000,5,158,1345,menengah,otomatis
+4,SUV,Honda,CR-V,2022,38000,5,190,1619,premium,otomatis
+5,Hatchback,Honda,Jazz,2021,18000,5,120,1140,ekonomi,otomatis
+6,SUV,Mitsubishi,Pajero Sport,2022,47000,7,181,2040,premium,otomatis
+7,MPV,Mitsubishi,Xpander,2021,22000,7,105,1415,menengah,otomatis
+8,Sedan,Toyota,Camry,2023,32000,5,178,1565,premium,otomatis
+9,Hatchback,Toyota,Yaris,2021,16000,5,107,1060,ekonomi,otomatis
+10,SUV,Suzuki,Grand Vitara,2022,27000,5,147,1395,menengah,manual
+11,SUV,Toyota,Fortuner,2023,44000,7,163,1920,premium,otomatis
+12,MPV,Daihatsu,Xenia,2021,15000,7,94,1165,ekonomi,manual
+13,Sedan,Mazda,Mazda3,2022,29000,5,186,1368,premium,otomatis
+14,SUV,Mazda,CX-5,2023,39000,5,186,1619,premium,otomatis
+15,Hatchback,Suzuki,Baleno,2021,14000,5,90,965,ekonomi,manual
+16,SUV,Ford,Everest,2022,52000,7,170,2045,premium,otomatis
+17,MPV,Nissan,Livina,2021,18000,7,99,1380,ekonomi,otomatis
+18,SUV,Nissan,X-Trail,2022,37000,5,169,1565,premium,otomatis
+19,Sedan,BMW,3 Series,2023,65000,5,255,1590,luxury,otomatis
+20,SUV,BMW,X3,2023,72000,5,248,1970,luxury,otomatis
+21,SUV,Toyota,Fortuner,2021,39000,7,163,1920,premium,otomatis
+22,MPV,Toyota,Avanza,2021,13000,7,94,1175,ekonomi,manual
+23,Sedan,Honda,Accord,2022,36000,5,192,1522,premium,otomatis
+24,SUV,Honda,HR-V,2022,31000,5,131,1345,menengah,otomatis
+25,Hatchback,Daihatsu,Ayla,2021,8000,4,65,780,ekonomi,manual
+26,SUV,Mitsubishi,Eclipse Cross,2022,35000,5,151,1660,menengah,otomatis
+27,MPV,Suzuki,Ertiga,2021,17000,7,104,1130,menengah,manual
+28,Sedan,Mercedes,C-Class,2023,68000,5,255,1670,luxury,otomatis
+29,SUV,Mercedes,GLC,2023,78000,5,258,1870,luxury,otomatis
+30,Hatchback,Toyota,Raize,2022,19000,5,88,1025,ekonomi,otomatis
+31,SUV,Toyota,Rush,2021,24000,7,102,1285,menengah,otomatis
+32,MPV,Honda,Mobilio,2021,17000,7,119,1205,menengah,otomatis
+33,Sedan,Toyota,Vios,2022,18000,5,107,1070,menengah,otomatis
+34,SUV,Hyundai,Tucson,2022,36000,5,159,1658,premium,otomatis
+35,SUV,Hyundai,Creta,2021,24000,5,123,1370,menengah,otomatis
+36,MPV,Wuling,Confero,2021,11000,7,94,1565,ekonomi,manual
+37,Sedan,Kia,K3,2022,20000,5,128,1265,menengah,otomatis
+38,SUV,Kia,Seltos,2022,30000,5,140,1395,menengah,otomatis
+39,Hatchback,Kia,Rio,2021,16000,5,120,1100,ekonomi,otomatis
+40,SUV,Wuling,Almaz,2022,27000,7,139,1825,menengah,otomatis
+41,SUV,Toyota,Fortuner,2020,36000,7,163,1920,premium,manual
+42,MPV,Toyota,Innova,2020,25000,8,136,1855,menengah,manual
+43,Sedan,Honda,City,2022,20000,5,119,1180,menengah,otomatis
+44,SUV,Honda,Passport,2022,45000,5,280,1840,premium,otomatis
+45,Hatchback,Suzuki,Swift,2021,15000,5,90,975,ekonomi,otomatis
+46,SUV,Subaru,Forester,2022,41000,5,182,1520,premium,otomatis
+47,MPV,Suzuki,XL7,2021,19000,7,104,1130,menengah,manual
+48,Sedan,Lexus,ES,2023,58000,5,178,1775,luxury,otomatis
+49,SUV,Lexus,UX,2023,48000,5,168,1675,luxury,otomatis
+50,Hatchback,Toyota,Agya,2021,9000,4,65,845,ekonomi,manual
+51,SUV,Toyota,Kijang Innova,2022,30000,7,136,1855,menengah,otomatis
+52,MPV,Daihatsu,Terios,2021,19000,7,102,1260,menengah,manual
+53,Sedan,Mazda,Mazda6,2022,38000,5,192,1615,premium,otomatis
+54,SUV,Mazda,CX-8,2023,48000,6,227,1915,premium,otomatis
+55,Hatchback,Honda,Brio,2021,12000,5,89,900,ekonomi,manual
+56,SUV,Volkswagen,Tiguan,2022,43000,5,180,1640,premium,otomatis
+57,MPV,Toyota,Sienta,2021,21000,7,98,1295,menengah,otomatis
+58,Sedan,Audi,A4,2023,62000,5,248,1685,luxury,otomatis
+59,SUV,Audi,Q5,2023,70000,5,261,1980,luxury,otomatis
+60,Hatchback,Nissan,March,2021,14000,5,98,1010,ekonomi,otomatis
+61,SUV,Toyota,Fortuner,2019,33000,7,163,1920,premium,manual
+62,MPV,Toyota,Innova,2019,22000,8,136,1855,menengah,manual
+63,Sedan,Honda,Civic,2022,22500,5,158,1345,menengah,otomatis
+64,SUV,Honda,CR-V,2021,35000,5,190,1619,premium,otomatis
+65,Hatchback,Honda,Jazz,2020,16500,5,120,1140,ekonomi,otomatis
+66,SUV,Mitsubishi,Pajero Sport,2021,44000,7,181,2040,premium,otomatis
+67,MPV,Mitsubishi,Xpander,2020,20000,7,105,1415,menengah,manual
+68,Sedan,Toyota,Camry,2022,30000,5,178,1565,premium,otomatis
+69,Hatchback,Toyota,Yaris,2020,14500,5,107,1060,ekonomi,manual
+70,SUV,Suzuki,Grand Vitara,2021,25000,5,147,1395,menengah,manual
+71,SUV,Ford,Everest,2021,49000,7,170,2045,premium,otomatis
+72,MPV,Nissan,Livina,2020,16500,7,99,1380,ekonomi,manual
+73,SUV,Nissan,X-Trail,2021,34000,5,169,1565,premium,otomatis
+74,Sedan,BMW,3 Series,2022,61000,5,255,1590,luxury,otomatis
+75,SUV,BMW,X3,2022,68000,5,248,1970,luxury,otomatis
+76,SUV,Toyota,Rush,2022,25500,7,102,1285,menengah,otomatis
+77,MPV,Honda,Mobilio,2022,18000,7,119,1205,menengah,otomatis
+78,Sedan,Toyota,Vios,2021,17000,5,107,1070,menengah,manual
+79,SUV,Hyundai,Tucson,2021,33000,5,159,1658,premium,otomatis
+80,SUV,Hyundai,Creta,2022,25500,5,123,1370,menengah,otomatis
+81,MPV,Wuling,Confero,2022,12000,7,94,1565,ekonomi,manual
+82,Sedan,Kia,K3,2021,18500,5,128,1265,menengah,manual
+83,SUV,Kia,Seltos,2021,28000,5,140,1395,menengah,otomatis
+84,Hatchback,Kia,Rio,2020,14500,5,120,1100,ekonomi,manual
+85,SUV,Wuling,Almaz,2021,25000,7,139,1825,menengah,manual
+86,SUV,Subaru,Forester,2021,38000,5,182,1520,premium,otomatis
+87,MPV,Suzuki,XL7,2022,20500,7,104,1130,menengah,otomatis
+88,Sedan,Lexus,ES,2022,55000,5,178,1775,luxury,otomatis
+89,SUV,Lexus,UX,2022,45000,5,168,1675,luxury,otomatis
+90,Hatchback,Toyota,Agya,2022,9500,4,65,845,ekonomi,manual
+91,SUV,Toyota,Kijang Innova,2021,28000,7,136,1855,menengah,otomatis
+92,MPV,Daihatsu,Terios,2022,20000,7,102,1260,menengah,otomatis
+93,Sedan,Mazda,Mazda6,2021,35000,5,192,1615,premium,otomatis
+94,SUV,Mazda,CX-8,2022,45000,6,227,1915,premium,otomatis
+95,Hatchback,Honda,Brio,2022,13000,5,89,900,ekonomi,otomatis
+96,SUV,Volkswagen,Tiguan,2021,40000,5,180,1640,premium,manual
+97,MPV,Toyota,Sienta,2022,22000,7,98,1295,menengah,otomatis
+98,Sedan,Audi,A4,2022,58000,5,248,1685,luxury,otomatis
+99,SUV,Audi,Q5,2022,66000,5,261,1980,luxury,otomatis
+100,Hatchback,Nissan,March,2022,15000,5,98,1010,ekonomi,otomatis
